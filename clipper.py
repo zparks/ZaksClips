@@ -125,18 +125,39 @@ def _filter_autoclips(clips, token):
             and c["title"] == vod_titles[c["video_id"]]]
 
 
-def get_recent_clips(token, user_id, count=10, days=CLIP_DAYS):
-    started_at = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    resp = requests.get(
-        "https://api.twitch.tv/helix/clips",
-        headers={
-            "Client-ID": TWITCH_CLIENT_ID,
-            "Authorization": f"Bearer {token}",
-        },
-        params={"broadcaster_id": user_id, "first": 50, "started_at": started_at},
-    )
-    resp.raise_for_status()
-    clips = resp.json()["data"]
+def get_recent_clips(token, user_id, count=20, days=CLIP_DAYS):
+    # Fetch day-by-day to avoid Twitch's view-count sorting dropping low-view clips
+    now = datetime.now(timezone.utc)
+    seen_ids = set()
+    clips = []
+    for d in range(days):
+        day_start = (now - timedelta(days=d + 1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        day_end = (now - timedelta(days=d)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cursor = None
+        for _ in range(5):  # max 5 pages per day
+            params = {
+                "broadcaster_id": user_id, "first": 50,
+                "started_at": day_start, "ended_at": day_end,
+            }
+            if cursor:
+                params["after"] = cursor
+            resp = requests.get(
+                "https://api.twitch.tv/helix/clips",
+                headers={
+                    "Client-ID": TWITCH_CLIENT_ID,
+                    "Authorization": f"Bearer {token}",
+                },
+                params=params,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            for c in data["data"]:
+                if c["id"] not in seen_ids:
+                    seen_ids.add(c["id"])
+                    clips.append(c)
+            cursor = data.get("pagination", {}).get("cursor")
+            if not cursor:
+                break
     if not SHOW_OTHERS_CLIPS:
         clips = [c for c in clips if c.get("creator_name", "").lower() == TWITCH_USERNAME.lower()]
     if not SHOW_AUTOCLIPS:
