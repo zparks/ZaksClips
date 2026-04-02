@@ -31,6 +31,8 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 YOUTUBE_CHANNEL_HANDLE = os.getenv("YOUTUBE_CHANNEL_HANDLE", "")
 YOUTUBE_CLIENT_ID = os.getenv("YOUTUBE_CLIENT_ID", "")
 YOUTUBE_CLIENT_SECRET = os.getenv("YOUTUBE_CLIENT_SECRET", "")
+TIKTOK_CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "")
+TIKTOK_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "")
 SHOW_AUTOCLIPS = os.getenv("SHOW_AUTOCLIPS", "true").lower() == "true"
 SHOW_OTHERS_CLIPS = os.getenv("SHOW_OTHERS_CLIPS", "true").lower() == "true"
 CLIP_DAYS = int(os.getenv("CLIP_DAYS", "7"))
@@ -40,6 +42,8 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 BROWSER_DATA_DIR = Path(__file__).parent / ".browser_session"
 YOUTUBE_TOKEN_PATH = Path(__file__).parent / ".youtube_token.json"
+TIKTOK_TOKEN_PATH = Path(__file__).parent / ".tiktok_token.json"
+TIKTOK_REDIRECT_URI = "http://localhost:3000/callback/"
 
 TIKTOK_LIVE_CENTER_URL = "https://livecenter.tiktok.com/replay?lang=en"
 
@@ -606,10 +610,285 @@ def upload_to_youtube(video_path, title, description):
     return video_url
 
 
+# ─── TikTok OAuth & Upload ──────────────────────────────────────────────────
+
+def _tiktok_load_token():
+    """Load saved TikTok token from disk."""
+    import json
+    if not TIKTOK_TOKEN_PATH.exists():
+        return None
+    with open(TIKTOK_TOKEN_PATH) as f:
+        return json.load(f)
+
+
+def _tiktok_save_token(token_data):
+    """Save TikTok token to disk."""
+    import json
+    with open(TIKTOK_TOKEN_PATH, "w") as f:
+        json.dump(token_data, f, indent=2)
+
+
+def _tiktok_refresh_token(token_data):
+    """Refresh an expired TikTok access token."""
+    resp = requests.post(
+        "https://open.tiktokapis.com/v2/oauth/token/",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "client_key": TIKTOK_CLIENT_KEY,
+            "client_secret": TIKTOK_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": token_data["refresh_token"],
+        },
+    )
+    resp.raise_for_status()
+    new_data = resp.json()
+    if "access_token" not in new_data:
+        print(f"  TikTok refresh failed: {new_data}")
+        return None
+    new_data["obtained_at"] = time.time()
+    _tiktok_save_token(new_data)
+    print("  ✓ TikTok token refreshed")
+    return new_data
+
+
+def get_tiktok_access_token():
+    """Get a valid TikTok access token. Launches browser auth on first run."""
+    import json
+    import webbrowser
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from urllib.parse import urlparse, parse_qs
+
+    # Try loading saved token
+    token_data = _tiktok_load_token()
+    if token_data:
+        age = time.time() - token_data.get("obtained_at", 0)
+        expires_in = token_data.get("expires_in", 86400)
+        if age < expires_in - 300:
+            return token_data["access_token"]
+        # Token expired, try refresh
+        refreshed = _tiktok_refresh_token(token_data)
+        if refreshed:
+            return refreshed["access_token"]
+
+    if not TIKTOK_CLIENT_KEY or not TIKTOK_CLIENT_SECRET:
+        print("\n  TikTok upload requires credentials.")
+        print("  Add TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET to your .env")
+        return None
+
+    # OAuth with PKCE: open browser, catch the callback
+    # TikTok uses hex-encoded SHA256 for code_challenge (not base64url like standard PKCE)
+    import secrets
+    import hashlib
+    import string
+    csrf_state = secrets.token_urlsafe(16)
+    # code_verifier: 43-128 chars from unreserved charset [A-Za-z0-9-._~]
+    charset = string.ascii_letters + string.digits + "-._~"
+    code_verifier = "".join(secrets.choice(charset) for _ in range(64))
+    code_challenge = hashlib.sha256(code_verifier.encode("ascii")).hexdigest()
+
+    auth_url = (
+        "https://www.tiktok.com/v2/auth/authorize/"
+        f"?client_key={TIKTOK_CLIENT_KEY}"
+        "&scope=user.info.basic,video.publish,video.upload"
+        "&response_type=code"
+        f"&redirect_uri={TIKTOK_REDIRECT_URI}"
+        f"&state={csrf_state}"
+        f"&code_challenge={code_challenge}"
+        "&code_challenge_method=S256"
+    )
+
+    auth_code = None
+
+    class CallbackHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            nonlocal auth_code
+            qs = parse_qs(urlparse(self.path).query)
+            if qs.get("state", [None])[0] != csrf_state:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"State mismatch - try again.")
+                return
+            if "error" in qs:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(f"Error: {qs['error'][0]} — {qs.get('error_description', [''])[0]}".encode())
+                return
+            auth_code = qs.get("code", [None])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<h2>TikTok authorized! You can close this tab.</h2>")
+
+        def log_message(self, format, *args):
+            pass  # suppress server logs
+
+    print("\n  Opening browser for TikTok authorization (one-time setup)...")
+    HTTPServer.allow_reuse_address = True
+    server = HTTPServer(("localhost", 3000), CallbackHandler)
+    webbrowser.open(auth_url)
+
+    # Wait for the callback
+    while auth_code is None:
+        server.handle_request()
+    server.server_close()
+
+    # Exchange code for token (include PKCE code_verifier)
+    resp = requests.post(
+        "https://open.tiktokapis.com/v2/oauth/token/",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "client_key": TIKTOK_CLIENT_KEY,
+            "client_secret": TIKTOK_CLIENT_SECRET,
+            "code": auth_code,
+            "grant_type": "authorization_code",
+            "redirect_uri": TIKTOK_REDIRECT_URI,
+            "code_verifier": code_verifier,
+        },
+    )
+    resp.raise_for_status()
+    token_data = resp.json()
+
+    if "access_token" not in token_data:
+        print(f"  TikTok token exchange failed: {token_data}")
+        return None
+
+    token_data["obtained_at"] = time.time()
+    _tiktok_save_token(token_data)
+    print("  ✓ TikTok credentials saved")
+    return token_data["access_token"]
+
+
+def upload_to_tiktok(video_path, title):
+    """Upload a video to TikTok via the Content Posting API. Returns publish_id or None."""
+    access_token = get_tiktok_access_token()
+    if not access_token:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json; charset=UTF-8",
+    }
+
+    # Step 1: Query creator info to get allowed privacy levels
+    print("\n  Querying TikTok creator info...")
+    info_resp = requests.post(
+        "https://open.tiktokapis.com/v2/post/publish/creator_info/query/",
+        headers=headers,
+    )
+    if info_resp.status_code != 200:
+        print(f"  TikTok creator info failed ({info_resp.status_code}): {info_resp.text[:500]}")
+        return None
+
+    creator_info = info_resp.json().get("data", {})
+    privacy_options = creator_info.get("privacy_level_options", ["SELF_ONLY"])
+    max_duration = creator_info.get("max_video_post_duration_sec", 600)
+
+    # Pick best available privacy: PUBLIC > FRIENDS > SELF_ONLY
+    if "PUBLIC_TO_EVERYONE" in privacy_options:
+        privacy = "PUBLIC_TO_EVERYONE"
+    elif "MUTUAL_FOLLOW_FRIENDS" in privacy_options:
+        privacy = "MUTUAL_FOLLOW_FRIENDS"
+    else:
+        privacy = "SELF_ONLY"
+    print(f"  Privacy: {privacy}")
+
+    # Step 2: Initialize upload
+    file_size = video_path.stat().st_size
+    chunk_size = min(file_size, 10_000_000)  # 10MB chunks
+    total_chunks = (file_size + chunk_size - 1) // chunk_size
+
+    init_body = {
+        "post_info": {
+            "title": title[:150],
+            "privacy_level": privacy,
+            "disable_comment": False,
+            "disable_duet": False,
+            "disable_stitch": False,
+            "video_cover_timestamp_ms": 1000,
+        },
+        "source_info": {
+            "source": "FILE_UPLOAD",
+            "video_size": file_size,
+            "chunk_size": chunk_size,
+            "total_chunk_count": total_chunks,
+        },
+    }
+
+    print("  Initializing TikTok upload...")
+    init_resp = requests.post(
+        "https://open.tiktokapis.com/v2/post/publish/video/init/",
+        headers=headers,
+        json=init_body,
+    )
+    if init_resp.status_code != 200:
+        print(f"  TikTok init failed ({init_resp.status_code}): {init_resp.text[:500]}")
+        return None
+
+    init_data = init_resp.json().get("data", {})
+    publish_id = init_data.get("publish_id")
+    upload_url = init_data.get("upload_url")
+
+    if not upload_url:
+        print(f"  TikTok init returned no upload_url: {init_resp.json()}")
+        return None
+
+    # Step 3: Upload chunks
+    print(f"  Uploading {file_size / 1_000_000:.1f} MB in {total_chunks} chunk(s)...")
+    with open(video_path, "rb") as f:
+        for i in range(total_chunks):
+            chunk = f.read(chunk_size)
+            start = i * chunk_size
+            end = start + len(chunk) - 1
+
+            put_resp = requests.put(
+                upload_url,
+                headers={
+                    "Content-Type": "video/mp4",
+                    "Content-Range": f"bytes {start}-{end}/{file_size}",
+                    "Content-Length": str(len(chunk)),
+                },
+                data=chunk,
+            )
+
+            if put_resp.status_code not in (200, 201, 206):
+                print(f"  Chunk {i+1} failed ({put_resp.status_code}): {put_resp.text[:300]}")
+                return None
+
+            pct = int((i + 1) / total_chunks * 100)
+            print(f"  ⬆ {pct}%", end="\r")
+
+    print(f"\n  ✓ Upload complete (publish_id: {publish_id})")
+
+    # Step 4: Poll for publish status
+    print("  Waiting for TikTok to process...")
+    for _ in range(30):
+        time.sleep(5)
+        status_resp = requests.post(
+            "https://open.tiktokapis.com/v2/post/publish/status/fetch/",
+            headers=headers,
+            json={"publish_id": publish_id},
+        )
+        if status_resp.status_code != 200:
+            continue
+        status_data = status_resp.json().get("data", {})
+        status = status_data.get("status")
+        if status == "PUBLISH_COMPLETE":
+            print("  ✓ Published to TikTok!")
+            return publish_id
+        elif status in ("FAILED", "PUBLISH_FAILED"):
+            fail_reason = status_data.get("fail_reason", "unknown")
+            print(f"  ✗ TikTok publish failed: {fail_reason}")
+            return None
+        # PROCESSING_UPLOAD or PROCESSING_DOWNLOAD — keep waiting
+
+    print("  ✗ TikTok publish timed out (may still be processing)")
+    return publish_id
+
+
 # ─── Preview & Upload ───────────────────────────────────────────────────────
 
 def preview_and_upload(output_path, title, description):
-    """Open video for review, then optionally upload to YouTube Shorts."""
+    """Open video for review, then optionally upload to YouTube Shorts and/or TikTok."""
     # Gate 1: Preview the video
     print("\n  Opening video for preview...")
     subprocess.run(["open", str(output_path)])
@@ -619,15 +898,20 @@ def preview_and_upload(output_path, title, description):
         print("  ✗ Video rejected — not uploading.")
         return
 
-    # Gate 2: Confirm upload
+    # Gate 2: YouTube upload
     print("\n  Upload to YouTube Shorts? (y/n)")
-    if input("  > ").strip().lower() != "y":
-        print("  ✗ Skipping upload.")
-        return
+    if input("  > ").strip().lower() == "y":
+        url = upload_to_youtube(output_path, title, description)
+        if url:
+            print(f"\n  🎬 YouTube: {url}")
 
-    url = upload_to_youtube(output_path, title, description)
-    if url:
-        print(f"\n  🎬 Live at: {url}")
+    # Gate 3: TikTok upload
+    if TIKTOK_CLIENT_KEY:
+        print("\n  Upload to TikTok? (y/n)")
+        if input("  > ").strip().lower() == "y":
+            publish_id = upload_to_tiktok(output_path, title)
+            if publish_id:
+                print(f"\n  🎬 TikTok publish_id: {publish_id}")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────

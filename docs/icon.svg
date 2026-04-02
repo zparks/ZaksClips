@@ -7,20 +7,46 @@
   </defs>
   <!-- Background -->
   <rect width="512" height="512" rx="96" fill="url(#bg)"/>
-  <!-- Film strip / clapper motif -->
-  <g transform="translate(256,240)">
-    <!-- Scissors / clip shape -->
-    <circle cx="-40" cy="-30" r="38" fill="none" stroke="#1D8CD7" stroke-width="14"/>
-    <circle cx="40" cy="-30" r="38" fill="none" stroke="#1D8CD7" stroke-width="14"/>
-    <line x1="-10" y1="8" x2="60" y2="110" stroke="#1D8CD7" stroke-width="14" stroke-linecap="round"/>
-    <line x1="10" y1="8" x2="-60" y2="110" stroke="#1D8CD7" stroke-width="14" stroke-linecap="round"/>
+
+  <!-- Video player frame -->
+  <rect x="96" y="110" width="320" height="200" rx="16" fill="#0d1117" stroke="#2a2a3e" stroke-width="4"/>
+
+  <!-- Stream content area (gradient to suggest live video) -->
+  <rect x="104" y="118" width="304" height="168" rx="10" fill="#1c1c30"/>
+
+  <!-- Play button / live indicator -->
+  <circle cx="256" cy="202" r="28" fill="rgba(29,140,215,0.25)"/>
+  <polygon points="246,188 246,216 270,202" fill="#1D8CD7"/>
+
+  <!-- LIVE badge -->
+  <rect x="340" y="128" width="56" height="22" rx="6" fill="#e53935"/>
+  <text x="368" y="144" text-anchor="middle" font-family="system-ui,Helvetica,Arial,sans-serif" font-weight="700" font-size="13" fill="#ffffff">LIVE</text>
+
+  <!-- Timeline / scrubber bar -->
+  <rect x="104" y="294" width="304" height="6" rx="3" fill="#2a2a3e"/>
+  <rect x="104" y="294" width="190" height="6" rx="3" fill="#1D8CD7"/>
+  <circle cx="294" cy="297" r="8" fill="#1D8CD7"/>
+
+  <!-- Clip selection brackets (the "clipping" part) -->
+  <!-- Left bracket -->
+  <rect x="160" y="286" width="4" height="22" rx="2" fill="#e0e0e0"/>
+  <rect x="160" y="284" width="14" height="4" rx="2" fill="#e0e0e0"/>
+  <rect x="160" y="306" width="14" height="4" rx="2" fill="#e0e0e0"/>
+  <!-- Right bracket -->
+  <rect x="348" y="286" width="4" height="22" rx="2" fill="#e0e0e0"/>
+  <rect x="338" y="284" width="14" height="4" rx="2" fill="#e0e0e0"/>
+  <rect x="338" y="306" width="14" height="4" rx="2" fill="#e0e0e0"/>
+  <!-- Highlighted clip region on timeline -->
+  <rect x="164" y="293" width="188" height="8" rx="3" fill="rgba(29,140,215,0.35)"/>
+
+  <!-- Scissors icon below the player -->
+  <g transform="translate(256,360)">
+    <circle cx="-18" cy="-10" r="14" fill="none" stroke="#1D8CD7" stroke-width="5"/>
+    <circle cx="18" cy="-10" r="14" fill="none" stroke="#1D8CD7" stroke-width="5"/>
+    <line x1="-6" y1="4" x2="24" y2="40" stroke="#1D8CD7" stroke-width="5" stroke-linecap="round"/>
+    <line x1="6" y1="4" x2="-24" y2="40" stroke="#1D8CD7" stroke-width="5" stroke-linecap="round"/>
   </g>
-  <!-- Chess piece (pawn) silhouette -->
-  <g transform="translate(256,130)" fill="#e0e0e0">
-    <circle cx="0" cy="-20" r="18"/>
-    <path d="M-12,-2 Q-20,15 -16,25 L16,25 Q20,15 12,-2 Z"/>
-    <rect x="-20" y="25" width="40" height="8" rx="3"/>
-  </g>
-  <!-- "CLIPPER" text -->
-  <text x="256" y="420" text-anchor="middle" font-family="system-ui,Helvetica,Arial,sans-serif" font-weight="700" font-size="52" fill="#ffffff" letter-spacing="8">CLIPPER</text>
+
+  <!-- "CLIPS" text -->
+  <text x="256" y="460" text-anchor="middle" font-family="system-ui,Helvetica,Arial,sans-serif" font-weight="700" font-size="46" fill="#ffffff" letter-spacing="6">ZAKSCLIPS</text>
 </svg>

@@ -106,8 +106,21 @@ python3 clipper.py
 - Twitch Helix API has no dedicated field for autoclips — `creator_name`, `creator_id`, and `is_featured` are identical between manual and autoclips by the same user. Title comparison against the VOD title is the only reliable heuristic.
 - VOD titles are fetched via `GET https://api.twitch.tv/helix/videos?id=` using the clip's `video_id` field, batched in groups of 100.
 
+## TikTok upload
+
+- Uses TikTok Content Posting API via OAuth2
+- Requires `TIKTOK_CLIENT_KEY` and `TIKTOK_CLIENT_SECRET` in `.env` (from developers.tiktok.com)
+- First run opens browser for TikTok auth, saves token to `.tiktok_token.json`
+- Access tokens last 24h, refresh tokens last 365 days — auto-refreshes
+- Redirect URI: `http://localhost:3000/callback/` (must match TikTok developer portal exactly)
+- App is in draft/unaudited mode — uploads are private (SELF_ONLY) until audit passes
+- User can manually flip videos to public in the TikTok app after upload
+- Three confirmation gates: 1) preview video, 2) YouTube upload, 3) TikTok upload
+- TikTok developer app name: "ZaksClips"
+- Domain verification file at `docs/tiktok9rb6Eu7UOqB9QfIDGjPqVP1nBX2U6r6G.txt`
+- GitHub Pages site for ToS/privacy: `https://zparks.github.io/ZaksClips/`
+
 ## Potential improvements not yet built
 
 - Auto-generate title from Whisper transcript using an LLM
-- Auto-upload to TikTok via their Content Posting API (requires business account approval)
 - Watch for new clips automatically after a stream ends
