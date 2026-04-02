@@ -615,8 +615,73 @@ def wrap_title(title, max_chars=14):
     return lines
 
 
+def make_title_card(video_path, title, duration=0.5):
+    """Generate a short title card video matching the input video's dimensions.
+    Returns the path to the title card video."""
+    font_path = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+    if not Path(font_path).exists():
+        font_path = "/System/Library/Fonts/Helvetica.ttc"
+
+    # Get video dimensions
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height",
+         "-of", "csv=p=0", str(video_path)],
+        capture_output=True, text=True,
+    )
+    w, h = probe.stdout.strip().split(",")
+
+    title_lines = wrap_title(title)
+    fontsize = 72
+    box_pad = 20
+    line_height = fontsize
+    total_height = len(title_lines) * line_height
+    base_y = f"(h*0.59)-{total_height // 2}"
+
+    drawtext_filters = ""
+    for i, line in enumerate(title_lines):
+        safe_line = line.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:").replace("%", "\\%")
+        y_expr = f"{base_y}+{i * line_height}"
+        drawtext_filters += (
+            f"drawtext=text='{safe_line}'"
+            f":fontfile='{font_path}'"
+            f":fontcolor=white"
+            f":fontsize={fontsize}"
+            f":x=(w-tw)/2"
+            f":y={y_expr}"
+            f":box=1"
+            f":boxcolor=#1D8CD7"
+            f":boxborderw={box_pad},"
+        )
+    drawtext_filters = drawtext_filters.rstrip(",")
+
+    card_path = OUTPUT_DIR / f"_titlecard_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", f"color=c=black:s={w}x{h}:d={duration}:r=30",
+        "-f", "lavfi",
+        "-i", f"anullsrc=r=44100:cl=stereo",
+        "-t", str(duration),
+        "-vf", drawtext_filters,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:a", "aac", "-shortest",
+        str(card_path),
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  Title card generation failed: {result.stderr[-500:]}")
+        return None
+    return card_path
+
+
 def burn_captions(video_path, ass_path, title, output_path):
     print("  Burning captions and title with ffmpeg...")
+
+    # Step 1: Generate title card
+    card_path = make_title_card(video_path, title)
 
     # Use a system font guaranteed to be on macOS
     font_path = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
@@ -654,6 +719,8 @@ def burn_captions(video_path, ass_path, title, output_path):
 
     vf = f"ass='{safe_ass_path}'{title_filters}"
 
+    # Step 2: Burn captions into the main video
+    captioned_path = OUTPUT_DIR / f"_captioned_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_path),
@@ -662,7 +729,7 @@ def burn_captions(video_path, ass_path, title, output_path):
         "-c:v", "libx264",
         "-preset", "fast",
         "-crf", "18",
-        str(output_path),
+        str(captioned_path),
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -670,6 +737,35 @@ def burn_captions(video_path, ass_path, title, output_path):
         print("\n  ffmpeg error:")
         print(result.stderr[-2000:])
         sys.exit(1)
+
+    # Step 3: Concatenate title card + captioned video
+    if card_path:
+        concat_list = OUTPUT_DIR / "_concat.txt"
+        with open(concat_list, "w") as f:
+            f.write(f"file '{card_path}'\n")
+            f.write(f"file '{captioned_path}'\n")
+
+        concat_cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-c", "copy",
+            str(output_path),
+        ]
+        result = subprocess.run(concat_cmd, capture_output=True, text=True)
+
+        # Clean up temp files
+        concat_list.unlink(missing_ok=True)
+        card_path.unlink(missing_ok=True)
+        captioned_path.unlink(missing_ok=True)
+
+        if result.returncode != 0:
+            print("\n  ffmpeg concat error:")
+            print(result.stderr[-2000:])
+            sys.exit(1)
+    else:
+        # No title card — just rename captioned as final
+        captioned_path.rename(output_path)
 
     print(f"  ✓ Saved: {output_path.name}")
 
