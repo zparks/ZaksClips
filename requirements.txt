@@ -1,0 +1,6 @@
+requests
+python-dotenv
+mlx_whisper
+playwright
+google-auth-oauthlib
+google-api-python-client

@@ -1,0 +1,18 @@
+# Secrets & tokens
+.env
+.youtube_token.json
+.tiktok_token.json
+
+# Browser session data
+.browser_session/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Output videos
+output/
+
+# macOS
+.DS_Store
