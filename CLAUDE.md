@@ -1,27 +1,36 @@
-# Chess Clip Automator
+# ZaksClips (formerly Clipper)
 
-Automates the post-stream TikTok clip workflow for a chess streamer.
+Automates the post-stream clip workflow for a chess streamer. Repo: github.com/zparks/ZaksClips
 
 ## What this does
 
-1. Fetches recent clips from Twitch API
+1. Fetches recent clips from Twitch API (day-by-day to catch all clips)
 2. Calculates the 2-minute VOD window ending at each clip
 3. Downloads segment (YouTube VOD via yt-dlp, or TikTok Live Center manual download)
-4. Prompts for title and description/caption
-5. Transcribes audio with Whisper (MLX, runs on M4)
-6. Burns styled captions + title into the video with ffmpeg
-7. Opens finished video for preview — user must confirm it's good
-8. Optionally uploads to YouTube Shorts (requires explicit confirmation)
+4. Opens raw video for preview — user can adjust segment timing (+/- start/end)
+5. Prompts for title and description/caption
+6. Transcribes audio with Whisper (MLX, runs on M4)
+7. Generates 0.5s title card + burns styled captions into the video with ffmpeg
+8. Copies finished video to iCloud Drive for phone access
+9. Optionally uploads to YouTube Shorts and/or TikTok (each with explicit confirmation)
+10. If upload fails, shows message to post from iCloud Drive on phone
+
+## CLI commands
+
+- `python3 clipper.py` — normal flow
+- `python3 clipper.py -r` — reprocess existing raw video (skip download)
+- `python3 clipper.py -c` — clean/manage output folder
 
 ## Stack
 
 - Python 3 — packages installed to system Python via `pip3 install --user --break-system-packages` (NOT using the venv)
 - `mlx-whisper` — Apple Silicon optimized Whisper large-v3, ~10-15s per clip
 - `playwright` — persistent Chromium session for TikTok Live Center
-- `ffmpeg` — burns captions (ASS format) and title overlay
+- `ffmpeg` — burns captions (ASS format), title overlay, title card, and local trimming
 - `google-api-python-client` + `google-auth-oauthlib` — YouTube Shorts upload via OAuth2
 - Twitch Helix API — fetches clips and VOD offsets
 - YouTube Data API v3 — VOD lookup and Shorts upload
+- TikTok Content Posting API — direct upload via OAuth2 + PKCE
 - No paid services, runs entirely local
 
 ## Key decisions
@@ -30,6 +39,21 @@ Automates the post-stream TikTok clip workflow for a chess streamer.
 - **No CapCut automation** — CapCut is canvas-based, Playwright can't reliably automate it. Whisper + styled ffmpeg captions replace it entirely
 - **2 minutes before clip end** — user's standard TikTok segment length, calculated from `vod_offset + duration - 120`
 - **Persistent browser session** — saved to `.browser_session/`, user logs into TikTok once, stays logged in
+- **Day-by-day clip fetching** — Twitch Helix clips endpoint sorts by views on wide date ranges and drops low-view clips. Fetching day-by-day ensures all clips are found.
+- **YouTube VOD matching checks day before** — streams that start before midnight UTC produce clips timestamped the next day. VOD search matches both the clip date and the previous day.
+- **Local trimming** — when shortening a segment (-N or e-N), ffmpeg crops locally instead of re-downloading. Only extends (+N or e+N) trigger a re-download.
+- **Title card for YouTube thumbnail** — 0.5s black frame with title at video start so YouTube grabs it as the Shorts thumbnail.
+- **iCloud Drive sync** — finished videos auto-copy to `~/Library/Mobile Documents/com~apple~CloudDocs/ZaksClips/` for phone access via Files app.
+
+## Segment adjustment
+
+After downloading, user can adjust timing before captions are burned:
+- `+10` — grab 10 more seconds before start (extends, re-downloads)
+- `-15` — trim 15 seconds from start (local crop)
+- `e-10` — trim 10 seconds from end (local crop)
+- `e+10` — extend 10 seconds past clip end (re-downloads)
+- Combine with commas: `+10,e-15`
+- Enter to keep as-is
 
 ## Caption & title styling
 
@@ -42,18 +66,26 @@ Automates the post-stream TikTok clip workflow for a chess streamer.
 - **Title position** — centered vertically around `y=h*0.59`, sits over the captions for the first 5 seconds
 - **Title background** — solid blue `#1D8CD7` (between sky and electric blue), `boxborderw=20`, lines spaced at fontsize only so boxes overlap and merge
 - **Font** — Arial Bold from macOS system fonts, fontsize 72 for title, 88 for captions
+- **Title card** — 0.5s black frame with title prepended to video for YouTube thumbnail
+
+## Output file naming
+
+Files are named `Title_MM-DD.mp4` (e.g. `Sunday_Funday_03-29.mp4`). No year in filename.
+Raw downloads use `yt_raw_` prefix, local trims use `trimmed_` prefix.
 
 ## Files
 
 ```
-clipper/
+ZaksClips/
 ├── clipper.py            — main script
 ├── setup.sh              — one-time install (ffmpeg, mlx-whisper, playwright)
 ├── .env.example          — credential template
 ├── .env                  — your actual credentials (never commit this)
 ├── .browser_session/     — saved TikTok login session
 ├── .youtube_token.json   — saved YouTube OAuth2 token (auto-refreshes)
-└── output/               — finished .mp4s land here
+├── .tiktok_token.json    — saved TikTok OAuth2 token (auto-refreshes)
+├── output/               — finished .mp4s land here
+└── docs/                 — GitHub Pages site (ToS, privacy, icon, TikTok verification)
 ```
 
 ## Setup (already done if you ran setup.sh)
@@ -66,16 +98,6 @@ Requires:
 - `TWITCH_CLIENT_ID` — from dev.twitch.tv/console
 - `TWITCH_CLIENT_SECRET` — from dev.twitch.tv/console
 - `TWITCH_USERNAME` — your Twitch channel name
-
-## Usage
-
-```bash
-python3 clipper.py
-```
-
-## TikTok Live Center URL
-
-`https://livecenter.tiktok.com/replay?lang=en`
 
 ## Environment notes
 
@@ -91,7 +113,7 @@ python3 clipper.py
 - Get these from Google Cloud Console → APIs & Services → Credentials → Create OAuth 2.0 Client ID (Desktop app type)
 - Must enable "YouTube Data API v3" on the Google Cloud project
 - First run opens browser for Google auth, saves token to `.youtube_token.json` (auto-refreshes after that)
-- Two confirmation gates: 1) preview video and confirm it's good, 2) confirm upload
+- Three confirmation gates: 1) preview video and confirm it's good, 2) YouTube upload, 3) TikTok upload
 - Never uploads without explicit approval
 - Description/caption is prompted alongside title — defaults to just the title if skipped
 - Uploads as public, category "Gaming", tagged with Shorts and chess
@@ -108,17 +130,21 @@ python3 clipper.py
 
 ## TikTok upload
 
-- Uses TikTok Content Posting API via OAuth2
+- Uses TikTok Content Posting API via OAuth2 with PKCE
+- **PKCE note**: TikTok uses hex-encoded SHA256 for code_challenge (NOT base64url like standard PKCE)
 - Requires `TIKTOK_CLIENT_KEY` and `TIKTOK_CLIENT_SECRET` in `.env` (from developers.tiktok.com)
 - First run opens browser for TikTok auth, saves token to `.tiktok_token.json`
 - Access tokens last 24h, refresh tokens last 365 days — auto-refreshes
 - Redirect URI: `http://localhost:3000/callback/` (must match TikTok developer portal exactly)
-- App is in draft/unaudited mode — uploads are private (SELF_ONLY) until audit passes
-- User can manually flip videos to public in the TikTok app after upload
-- Three confirmation gates: 1) preview video, 2) YouTube upload, 3) TikTok upload
+- **Currently using sandbox credentials** — production app submitted for review (5-10 business days)
+- Unaudited production apps get `unauthorized_client` error on OAuth — must use sandbox with test users, or pass review
+- Once review passes: swap `.env` back to production keys (`awjzj5ky1gunw3sh` / `Xga3Iz1bHh9HZ6IRNBOWon8e8dtCUhYK`)
+- Sandbox credentials: `sbawcyrvxsaacdhwl8` / `igEozUD5LId0TqjkIt9WDNKtWrjWatIT`
 - TikTok developer app name: "ZaksClips"
 - Domain verification file at `docs/tiktok9rb6Eu7UOqB9QfIDGjPqVP1nBX2U6r6G.txt`
 - GitHub Pages site for ToS/privacy: `https://zparks.github.io/ZaksClips/`
+- Chunked upload: files under 64MB upload as single chunk; larger files use 10MB chunks
+- 5MB minimum chunk size only applies to non-final chunks in multi-chunk uploads
 
 ## Potential improvements not yet built
 
