@@ -40,6 +40,8 @@ CLIP_DAYS = int(os.getenv("CLIP_DAYS", "7"))
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+ICLOUD_DIR = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/ZaksClips"
+
 BROWSER_DATA_DIR = Path(__file__).parent / ".browser_session"
 YOUTUBE_TOKEN_PATH = Path(__file__).parent / ".youtube_token.json"
 TIKTOK_TOKEN_PATH = Path(__file__).parent / ".tiktok_token.json"
@@ -49,6 +51,14 @@ TIKTOK_LIVE_CENTER_URL = "https://livecenter.tiktok.com/replay?lang=en"
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def safe_filename(title, date_str):
+    """Create a filename from title + date. e.g. 'Sunday Funday' + '2026-03-29' → 'Sunday_Funday_03-29'"""
+    clean = re.sub(r'[^\w\s-]', '', title).strip()
+    clean = re.sub(r'\s+', '_', clean)
+    month_day = date_str[5:10]  # "03-29" from "2026-03-29"
+    return f"{clean}_{month_day}"
+
 
 def fmt_time(seconds):
     """Format seconds as H:MM:SS or M:SS."""
@@ -166,6 +176,125 @@ def get_recent_clips(token, user_id, count=20, days=CLIP_DAYS):
     return clips[:count]
 
 
+# ─── Segment adjustment ──────────────────────────────────────────────────────
+
+def parse_adjustment(text):
+    """Parse adjustment input like '+10', '-15', 'e+10', 'e-20'.
+    Returns (start_delta, end_delta) in seconds.
+    + = more video (start earlier / end later), - = less video."""
+    text = text.strip().lower()
+    if not text:
+        return 0, 0
+
+    adjustments = [a.strip() for a in text.split(",")]
+    start_delta = 0
+    end_delta = 0
+
+    for adj in adjustments:
+        if not adj:
+            continue
+        if adj.startswith("e"):
+            # End adjustment
+            val = adj[1:]
+            try:
+                end_delta += int(val)
+            except ValueError:
+                print(f"  Couldn't parse '{adj}', skipping")
+        else:
+            # Start adjustment: +N means start earlier (subtract from start),
+            # -N means start later (add to start)
+            try:
+                val = int(adj)
+                start_delta += val
+            except ValueError:
+                print(f"  Couldn't parse '{adj}', skipping")
+
+    return start_delta, end_delta
+
+
+def trim_video(video_path, trim_start_secs, trim_end_secs):
+    """Trim a video locally with ffmpeg. trim_start_secs trims from the front,
+    trim_end_secs trims from the tail. Returns the new file path."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    trimmed_path = OUTPUT_DIR / f"trimmed_{stamp}.mp4"
+
+    cmd = ["ffmpeg", "-y", "-i", str(video_path)]
+
+    if trim_start_secs > 0:
+        cmd += ["-ss", str(trim_start_secs)]
+    if trim_end_secs > 0:
+        # Get duration and subtract trim from end
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+            capture_output=True, text=True,
+        )
+        total = float(probe.stdout.strip())
+        new_duration = total - trim_start_secs - trim_end_secs
+        if new_duration <= 0:
+            print("  Trim would remove entire video, skipping.")
+            return video_path
+        cmd += ["-t", str(new_duration)]
+
+    cmd += ["-c", "copy", str(trimmed_path)]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  ffmpeg trim failed: {result.stderr[-500:]}")
+        return video_path
+
+    print(f"  ✓ Trimmed: {trimmed_path.name}")
+    return trimmed_path
+
+
+def preview_and_adjust(video_path, seg_start, seg_end, clip, download_fn):
+    """Open raw video, let user adjust segment timing. Trims locally when possible,
+    only re-downloads when extending. Returns final video_path, seg_start, seg_end."""
+    while True:
+        print("\n  Opening raw video for review...")
+        subprocess.run(["open", str(video_path)])
+
+        duration = seg_end - seg_start
+        print(f"\n  Segment: {fmt_time(seg_start)} → {fmt_time(seg_end)} ({fmt_time(duration)})")
+        print("  Adjust? Examples: +10 (more at start), -15 (trim start), e-10 (trim end), e+10 (more at end)")
+        print("  Combine with commas: +10,e-15")
+        print("  Enter to keep as-is")
+        choice = input("  > ").strip()
+
+        if not choice:
+            return video_path, seg_start, seg_end
+
+        start_delta, end_delta = parse_adjustment(choice)
+        if start_delta == 0 and end_delta == 0:
+            return video_path, seg_start, seg_end
+
+        new_start = max(0, seg_start - start_delta)
+        new_end = seg_end + end_delta
+
+        if new_end <= new_start:
+            print("  Invalid adjustment — end would be before start. Try again.")
+            continue
+
+        needs_redownload = new_start < seg_start or new_end > seg_end
+
+        if needs_redownload:
+            print(f"\n  New segment: {fmt_time(new_start)} → {fmt_time(new_end)} ({fmt_time(new_end - new_start)})")
+            print("  Extending — re-downloading...")
+            video_path = download_fn(new_start, new_end, clip)
+        else:
+            # Pure trim — crop locally
+            trim_front = seg_start - new_start + (-start_delta if start_delta < 0 else 0)
+            # start_delta < 0 means trim start: new_start = seg_start + abs(start_delta)
+            # So trim_front = new_start - seg_start... wait let me recalc
+            trim_front = new_start - seg_start  # how many secs into the video to start
+            trim_tail = seg_end - new_end       # how many secs to cut from end
+            print(f"\n  Trimming locally ({fmt_time(new_end - new_start)} final)...")
+            video_path = trim_video(video_path, trim_front, trim_tail)
+
+        seg_start = new_start
+        seg_end = new_end
+
+
 # ─── Clip selection ───────────────────────────────────────────────────────────
 
 def pick_clips(clips):
@@ -200,7 +329,7 @@ def pick_clips(clips):
 
 # ─── TikTok Live Center download ──────────────────────────────────────────────
 
-def download_from_tiktok(vod_end_seconds):
+def download_from_tiktok(seg_start, seg_end, clip=None):
     """
     Opens TikTok Live Center in a persistent browser session.
     Displays the exact timestamp to seek to.
@@ -208,8 +337,8 @@ def download_from_tiktok(vod_end_seconds):
     """
     from playwright.sync_api import sync_playwright
 
-    tiktok_start = max(0, vod_end_seconds - 120)
-    tiktok_end = vod_end_seconds
+    tiktok_start = seg_start
+    tiktok_end = seg_end
 
     print(f"\n  Target segment: {fmt_time(tiktok_start)} → {fmt_time(tiktok_end)}")
     print("  Opening TikTok Live Center in browser...")
@@ -272,8 +401,13 @@ def get_youtube_channel_id():
 
 
 def find_youtube_vod(channel_id, clip_created_at):
-    """Find a livestream VOD by matching actualStartTime date to the clip's date."""
-    clip_date = clip_created_at[:10]  # "2026-03-29"
+    """Find a livestream VOD by matching actualStartTime date to the clip's date.
+    Also checks the day before, since streams that start before midnight UTC
+    produce clips timestamped the next day."""
+    clip_dt = datetime.fromisoformat(clip_created_at.replace("Z", "+00:00"))
+    clip_date = clip_dt.strftime("%Y-%m-%d")
+    prev_date = (clip_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    match_dates = {clip_date, prev_date}
 
     # Step 1: get recent video IDs from the channel
     search_resp = requests.get(
@@ -283,7 +417,7 @@ def find_youtube_vod(channel_id, clip_created_at):
             "channelId": channel_id,
             "type": "video",
             "order": "date",
-            "maxResults": 10,
+            "maxResults": 50,
             "key": YOUTUBE_API_KEY,
         },
     )
@@ -305,11 +439,11 @@ def find_youtube_vod(channel_id, clip_created_at):
     details_resp.raise_for_status()
     videos = details_resp.json().get("items", [])
 
-    # Step 3: match on actualStartTime date
+    # Step 3: match on actualStartTime date (or the day before)
     matches = []
     for v in videos:
         start = v.get("liveStreamingDetails", {}).get("actualStartTime", "")
-        if start[:10] == clip_date:
+        if start[:10] in match_dates:
             matches.append({
                 "id": {"videoId": v["id"]},
                 "snippet": v["snippet"],
@@ -319,13 +453,14 @@ def find_youtube_vod(channel_id, clip_created_at):
 
 # ─── YouTube VOD download ─────────────────────────────────────────────────────
 
-def download_from_youtube(vod_end_seconds, clip_created_at):
+def download_from_youtube(seg_start, seg_end, clip=None):
     """
     Looks up the YouTube VOD matching the clip date, then downloads
-    the 2-minute segment using yt-dlp. Fully automated.
+    the segment using yt-dlp. Fully automated.
     """
-    yt_start = max(0, vod_end_seconds - 120)
-    yt_end = vod_end_seconds
+    clip_created_at = clip["created_at"] if clip else ""
+    yt_start = seg_start
+    yt_end = seg_end
 
     print("\n  Looking up YouTube VOD for this clip's date...")
     channel_id = get_youtube_channel_id()
@@ -815,8 +950,16 @@ def upload_to_tiktok(video_path, title):
 
     # Step 2: Initialize upload
     file_size = video_path.stat().st_size
-    chunk_size = min(file_size, 10_000_000)  # 10MB chunks
-    total_chunks = (file_size + chunk_size - 1) // chunk_size
+    # TikTok: chunk_size min 5MB, max 64MB, final chunk can be up to 128MB.
+    # For files under 64MB use a single chunk (chunk_size must be >= file_size).
+    # For tiny files under 5MB, still use file_size — TikTok's min only applies
+    # to non-final chunks in multi-chunk uploads.
+    if file_size <= 64_000_000:
+        chunk_size = file_size
+        total_chunks = 1
+    else:
+        chunk_size = 10_000_000
+        total_chunks = (file_size + chunk_size - 1) // chunk_size
 
     init_body = {
         "post_info": {
@@ -908,6 +1051,15 @@ def upload_to_tiktok(video_path, title):
 
 # ─── Preview & Upload ───────────────────────────────────────────────────────
 
+def copy_to_icloud(video_path):
+    """Copy finished video to iCloud Drive so it's accessible on phone."""
+    import shutil
+    ICLOUD_DIR.mkdir(exist_ok=True)
+    dest = ICLOUD_DIR / video_path.name
+    shutil.copy2(video_path, dest)
+    print(f"  ✓ Copied to iCloud Drive → Files app → ZaksClips/{video_path.name}")
+
+
 def preview_and_upload(output_path, title, description):
     """Open video for review, then optionally upload to YouTube Shorts and/or TikTok."""
     # Gate 1: Preview the video
@@ -919,12 +1071,20 @@ def preview_and_upload(output_path, title, description):
         print("  ✗ Video rejected — not uploading.")
         return
 
+    # Copy to iCloud Drive for phone access
+    copy_to_icloud(output_path)
+
+    icloud_msg = f"  Post manually from iCloud Drive → Files → ZaksClips/{output_path.name}"
+
     # Gate 2: YouTube upload
     print("\n  Upload to YouTube Shorts? (y/n)")
     if input("  > ").strip().lower() == "y":
         url = upload_to_youtube(output_path, title, description)
         if url:
             print(f"\n  🎬 YouTube: {url}")
+        else:
+            print(f"\n  ✗ YouTube upload failed.")
+            print(icloud_msg)
 
     # Gate 3: TikTok upload
     if TIKTOK_CLIENT_KEY:
@@ -933,6 +1093,9 @@ def preview_and_upload(output_path, title, description):
             publish_id = upload_to_tiktok(output_path, title)
             if publish_id:
                 print(f"\n  🎬 TikTok publish_id: {publish_id}")
+            else:
+                print(f"\n  ✗ TikTok upload failed.")
+                print(icloud_msg)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -944,8 +1107,8 @@ def reprocess():
     print("  ══════════════════════════════════════")
 
     raw_files = sorted(OUTPUT_DIR.glob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True)
-    # Exclude already-finished tiktok_ outputs
-    raw_files = [f for f in raw_files if not f.name.startswith("tiktok_")]
+    # Only show raw downloads (yt_raw_ and trimmed_) not finished outputs
+    raw_files = [f for f in raw_files if f.name.startswith(("yt_raw_", "trimmed_"))]
 
     if not raw_files:
         print("\n  No raw .mp4 files found in output/")
@@ -983,7 +1146,8 @@ def reprocess():
     ass_path = OUTPUT_DIR / f"{stamp}.ass"
     make_ass(result, ass_path)
 
-    output_path = OUTPUT_DIR / f"tiktok_{stamp}.mp4"
+    output_name = safe_filename(title, datetime.now().strftime("%Y-%m-%d"))
+    output_path = OUTPUT_DIR / f"{output_name}.mp4"
     burn_captions(video_path, ass_path, title, output_path)
 
     print()
@@ -993,10 +1157,58 @@ def reprocess():
     print()
 
 
+def clean():
+    """List output files and let user delete some or all."""
+    print()
+    print("  Chess Clip Automator — Clean Output")
+    print("  ════════════════════════════════════")
+
+    files = sorted(
+        [f for f in OUTPUT_DIR.iterdir() if f.name != ".DS_Store"],
+        key=lambda f: f.stat().st_mtime, reverse=True,
+    )
+    if not files:
+        print("\n  Output folder is empty.")
+        return
+
+    total_size = sum(f.stat().st_size for f in files)
+    print(f"\n  {len(files)} files ({total_size / 1_000_000:.1f} MB total):\n")
+    for i, f in enumerate(files):
+        size = f.stat().st_size / 1_000_000
+        print(f"  [{i+1}] {f.name}  ({size:.1f} MB)")
+
+    print("\n  Delete which? (e.g. 1,3 or 'all' or Enter to cancel)")
+    choice = input("  > ").strip().lower()
+
+    if not choice:
+        print("  Cancelled.")
+        return
+
+    if choice == "all":
+        to_delete = files
+    else:
+        indices = [int(x.strip()) - 1 for x in choice.split(",") if x.strip().isdigit()]
+        to_delete = [files[i] for i in indices if 0 <= i < len(files)]
+
+    if not to_delete:
+        print("  Nothing selected.")
+        return
+
+    for f in to_delete:
+        f.unlink()
+        print(f"  ✗ Deleted: {f.name}")
+
+    print(f"\n  Removed {len(to_delete)} file(s).")
+
+
 def main():
     print()
     print("  Chess Clip Automator")
     print("  ════════════════════")
+
+    if "--clean" in sys.argv or "-c" in sys.argv:
+        clean()
+        return
 
     if "--reprocess" in sys.argv or "-r" in sys.argv:
         reprocess()
@@ -1026,14 +1238,18 @@ def main():
         print(f"  ══ {clip['title']} ══")
 
         vod_end = clip["vod_offset"] + clip["duration"]
+        seg_start = max(0, vod_end - 120)
+        seg_end = vod_end
 
         # 1. Download segment
-        if PLATFORM == "youtube":
-            video_path = download_from_youtube(vod_end, clip["created_at"])
-        else:
-            video_path = download_from_tiktok(vod_end)
+        download_fn = download_from_youtube if PLATFORM == "youtube" else download_from_tiktok
+        video_path = download_fn(seg_start, seg_end, clip)
 
-        # 2. Title & description
+        # 2. Preview raw video and adjust segment if needed
+        video_path, seg_start, seg_end = preview_and_adjust(
+            video_path, seg_start, seg_end, clip, download_fn)
+
+        # 3. Title & description
         print(f"\n  Title (Enter to use Twitch title: \"{clip['title']}\"):")
         custom_title = input("  > ").strip()
         title = custom_title if custom_title else clip["title"]
@@ -1043,22 +1259,23 @@ def main():
         if not description:
             description = title
 
-        # 3. Transcribe
+        # 4. Transcribe
         result = transcribe(video_path)
 
-        # 4. Generate subtitles
+        # 5. Generate subtitles
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         ass_path = OUTPUT_DIR / f"{stamp}.ass"
         make_ass(result, ass_path)
 
-        # 5. Burn in
-        output_path = OUTPUT_DIR / f"tiktok_{stamp}.mp4"
+        # 6. Burn in
+        output_name = safe_filename(title, clip["created_at"])
+        output_path = OUTPUT_DIR / f"{output_name}.mp4"
         burn_captions(video_path, ass_path, title, output_path)
 
         print()
         print(f"  🎬 Ready to post → {output_path}")
 
-        # 6. Preview & optional upload
+        # 7. Preview final & optional upload
         preview_and_upload(output_path, title, description)
 
     print()
