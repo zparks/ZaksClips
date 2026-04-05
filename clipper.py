@@ -8,6 +8,7 @@ at the right moment, then transcribes + burns captions and title into the video.
 import os
 import sys
 import time
+import plistlib
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -33,12 +34,36 @@ YOUTUBE_CLIENT_ID = os.getenv("YOUTUBE_CLIENT_ID", "")
 YOUTUBE_CLIENT_SECRET = os.getenv("YOUTUBE_CLIENT_SECRET", "")
 TIKTOK_CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "")
 TIKTOK_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+CLIP_MODE = os.getenv("CLIP_MODE", "off").lower()  # "off", "auto", or "auto-post"
 SHOW_AUTOCLIPS = os.getenv("SHOW_AUTOCLIPS", "true").lower() == "true"
 SHOW_OTHERS_CLIPS = os.getenv("SHOW_OTHERS_CLIPS", "true").lower() == "true"
-CLIP_DAYS = int(os.getenv("CLIP_DAYS", "7"))
+CLIP_DAYS = min(int(os.getenv("CLIP_DAYS", "3")), 60)
+CLIP_LENGTH = float(os.getenv("CLIP_LENGTH", "2"))  # minutes, 0.5-5
+SCHEDULE_HOUR = int(os.getenv("SCHEDULE_HOUR", "10"))  # 0-23, hour to run batch
+SCHEDULE_MINUTE = int(os.getenv("SCHEDULE_MINUTE", "0"))  # 0-59, minute to run batch
+
+# ─── Color themes & positioning ───────────────────────────────────────────────
+COLOR_THEMES = {
+    "white":  {"name": "Classic White",  "box": "#FFFFFF", "text": "#000000"},
+    "black":  {"name": "Classic Black",  "box": "#000000", "text": "#FFFFFF"},
+    "blue":   {"name": "Electric Blue",  "box": "#1D8CD7", "text": "#FFFFFF"},
+    "red":    {"name": "Fire Red",       "box": "#D72638", "text": "#FFFFFF"},
+    "green":  {"name": "Neon Green",     "box": "#39FF14", "text": "#000000"},
+    "purple": {"name": "Royal Purple",   "box": "#7B2FBE", "text": "#FFFFFF"},
+    "gold":   {"name": "Gold",           "box": "#FFB800", "text": "#000000"},
+}
+COLOR_THEME_ORDER = ["white", "black", "blue", "red", "green", "purple", "gold"]
+COLOR_THEME = os.getenv("COLOR_THEME", "blue")
+TITLE_Y_PERCENT = float(os.getenv("TITLE_Y_PERCENT", "59"))
+CAPTION_Y_PERCENT = float(os.getenv("CAPTION_Y_PERCENT", "65"))
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
+RAW_DIR = OUTPUT_DIR / "raw"
+RAW_DIR.mkdir(exist_ok=True)
+COMPLETED_DIR = OUTPUT_DIR / "completed"
+COMPLETED_DIR.mkdir(exist_ok=True)
 
 ICLOUD_DIR = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/ZaksClips"
 
@@ -131,8 +156,11 @@ def _filter_autoclips(clips, token):
         resp.raise_for_status()
         for v in resp.json()["data"]:
             vod_titles[v["id"]] = v["title"]
-    return [c for c in clips if c.get("video_id") in vod_titles
-            and c["title"] == vod_titles[c["video_id"]]]
+    # Keep clips whose VOD is expired (can't verify = assume manual),
+    # and clips whose title matches their VOD title (confirmed manual).
+    # Only drop clips we can confirm are autoclips (VOD exists + title differs).
+    return [c for c in clips if c.get("video_id") not in vod_titles
+            or c["title"] == vod_titles[c["video_id"]]]
 
 
 def get_recent_clips(token, user_id, count=20, days=CLIP_DAYS):
@@ -215,8 +243,8 @@ def parse_adjustment(text):
 def trim_video(video_path, trim_start_secs, trim_end_secs):
     """Trim a video locally with ffmpeg. trim_start_secs trims from the front,
     trim_end_secs trims from the tail. Returns the new file path."""
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    trimmed_path = OUTPUT_DIR / f"trimmed_{stamp}.mp4"
+    stamp = datetime.now().strftime("%m-%d_%H%M")
+    trimmed_path = RAW_DIR / f"trimmed_{stamp}.mp4"
 
     cmd = ["ffmpeg", "-y", "-i", str(video_path)]
 
@@ -311,10 +339,10 @@ def pick_clips(clips):
 
     for i, clip in enumerate(usable):
         vod_end = clip["vod_offset"] + clip["duration"]
-        seg_start = max(0, vod_end - 120)
+        seg_start = max(0, vod_end - int(CLIP_LENGTH * 60))
         print(f"  [{i+1}] {clip['title']}")
         print(f"       Created : {clip['created_at'][:10]}")
-        print(f"       Segment : {fmt_time(seg_start)} → {fmt_time(vod_end)}  (2 min ending at clip)")
+        print(f"       Segment : {fmt_time(seg_start)} → {fmt_time(vod_end)}  ({CLIP_LENGTH}min ending at clip)")
         print()
 
     print("Which clips do you want to process? (e.g. 1,3 or 'all')")
@@ -491,8 +519,8 @@ def download_from_youtube(seg_start, seg_end, clip=None):
             return f"{h}:{m:02d}:{sec:02d}"
         return f"{m}:{sec:02d}"
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = OUTPUT_DIR / f"yt_raw_{stamp}.mp4"
+    stamp = datetime.now().strftime("%m-%d_%H%M")
+    output_path = RAW_DIR / f"yt_raw_{stamp}.mp4"
     section = f"*{to_yt_ts(yt_start)}-{to_yt_ts(yt_end)}"
 
     cmd = [
@@ -525,12 +553,97 @@ def transcribe(video_path):
         language="en",
     )
     print(f"  ✓ Transcribed {len(result.get('segments', []))} segments")
+
+    # Release MLX/Metal GPU resources to prevent trace trap crashes in PyAV
+    import gc
+    gc.collect()
+    try:
+        import mlx.core as mx
+        mx.eval(mx.zeros(1))  # force Metal sync/flush
+    except Exception:
+        pass
+
     return result
+
+
+def generate_title_caption(transcript_text, clip_title=""):
+    """Use Claude to generate a title and caption from the transcript.
+    Returns (title, caption) or (None, None) if unavailable."""
+    if not ANTHROPIC_API_KEY:
+        print("  No ANTHROPIC_API_KEY — skipping AI title generation")
+        return None, None
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        prompt = f"""You are writing a title and caption for a chess TikTok/YouTube Short.
+
+Here is the transcript of the clip:
+{transcript_text[:3000]}
+
+{f'The Twitch clip was titled: "{clip_title}"' if clip_title else ''}
+
+Generate TWO things:
+
+1. TITLE: A short, punchy, ALL CAPS title (2-5 words). Think dramatic chess moments — like "INSANE QUEEN SACRIFICE" or "HE WALKED INTO MATE" or "THE FORK OF DOOM". Make it exciting and clickable. No quotes or punctuation.
+
+2. CAPTION: A quirky, funny one-liner caption that sounds casual and human (lowercase is fine). End it with #chess. Examples: "he never saw it coming #chess" or "sometimes you just gotta sac the queen #chess" or "that moment when the engine says +9 #chess"
+
+Reply in EXACTLY this format, nothing else:
+TITLE: YOUR TITLE HERE
+CAPTION: your caption here #chess"""
+
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        text = response.content[0].text.strip()
+        title = None
+        caption = None
+        for line in text.split("\n"):
+            line = line.strip()
+            if line.upper().startswith("TITLE:"):
+                title = line.split(":", 1)[1].strip().upper()
+            elif line.upper().startswith("CAPTION:"):
+                caption = line.split(":", 1)[1].strip()
+
+        if title:
+            print(f"  ✓ AI title: {title}")
+        if caption:
+            print(f"  ✓ AI caption: {caption}")
+        return title, caption
+
+    except Exception as e:
+        print(f"  AI title generation failed: {e}")
+        return None, None
+
+
+def get_transcript_text(whisper_result):
+    """Extract plain text from a Whisper result dict."""
+    return " ".join(
+        seg.get("text", "").strip()
+        for seg in whisper_result.get("segments", [])
+    ).strip()
 
 
 # ─── ASS subtitle generation ──────────────────────────────────────────────────
 
-ASS_HEADER = """\
+def _hex_to_ass(hex_color):
+    """Convert #RRGGBB to ASS &H00BBGGRR format."""
+    r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
+    return f"&H00{b:02X}{g:02X}{r:02X}"
+
+
+def _make_ass_header():
+    """Generate ASS header using current theme and caption Y position."""
+    theme = COLOR_THEMES.get(COLOR_THEME, COLOR_THEMES["blue"])
+    margin_v = int(1920 * (1 - CAPTION_Y_PERCENT / 100))
+    primary = _hex_to_ass(theme["text"])    # caption text color
+    outline = _hex_to_ass(theme["box"])     # caption outline = theme color
+    return f"""\
 [Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -539,7 +652,7 @@ WrapStyle: 1
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,88,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,2,0,1,5,2,2,60,60,672,1
+Style: Default,Arial,88,{primary},&H000000FF,{outline},&H00000000,1,0,0,0,100,100,2,0,1,5,2,2,60,60,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -591,7 +704,7 @@ def make_ass(result, output_path, max_chars=30):
             lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
 
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write(ASS_HEADER)
+        f.write(_make_ass_header())
         f.write("\n".join(lines))
 
     print(f"  ✓ Subtitles written ({len(lines)} lines)")
@@ -599,89 +712,8 @@ def make_ass(result, output_path, max_chars=30):
 
 # ─── ffmpeg: burn captions + title ───────────────────────────────────────────
 
-def wrap_title(title, max_chars=14):
-    """Wrap title into lines of max_chars, breaking at word boundaries."""
-    words = title.upper().split()
-    lines = []
-    current = ""
-    for word in words:
-        if current and len(current) + 1 + len(word) > max_chars:
-            lines.append(current)
-            current = word
-        else:
-            current = f"{current} {word}" if current else word
-    if current:
-        lines.append(current)
-    return lines
-
-
-def make_title_card(video_path, title, duration=0.5):
-    """Generate a short title card video matching the input video's dimensions.
-    Returns the path to the title card video."""
-    font_path = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
-    if not Path(font_path).exists():
-        font_path = "/System/Library/Fonts/Helvetica.ttc"
-
-    # Get video dimensions
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height",
-         "-of", "csv=p=0", str(video_path)],
-        capture_output=True, text=True,
-    )
-    w, h = probe.stdout.strip().split(",")
-
-    title_lines = wrap_title(title)
-    fontsize = 72
-    box_pad = 20
-    line_height = fontsize
-    total_height = len(title_lines) * line_height
-    base_y = f"(h*0.59)-{total_height // 2}"
-
-    drawtext_filters = ""
-    for i, line in enumerate(title_lines):
-        safe_line = line.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:").replace("%", "\\%")
-        y_expr = f"{base_y}+{i * line_height}"
-        drawtext_filters += (
-            f"drawtext=text='{safe_line}'"
-            f":fontfile='{font_path}'"
-            f":fontcolor=white"
-            f":fontsize={fontsize}"
-            f":x=(w-tw)/2"
-            f":y={y_expr}"
-            f":box=1"
-            f":boxcolor=#1D8CD7"
-            f":boxborderw={box_pad},"
-        )
-    drawtext_filters = drawtext_filters.rstrip(",")
-
-    card_path = OUTPUT_DIR / f"_titlecard_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi",
-        "-i", f"color=c=black:s={w}x{h}:d={duration}:r=30",
-        "-f", "lavfi",
-        "-i", f"anullsrc=r=44100:cl=stereo",
-        "-t", str(duration),
-        "-vf", drawtext_filters,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-c:a", "aac", "-shortest",
-        str(card_path),
-    ]
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"  Title card generation failed: {result.stderr[-500:]}")
-        return None
-    return card_path
-
-
 def burn_captions(video_path, ass_path, title, output_path):
     print("  Burning captions and title with ffmpeg...")
-
-    # Step 1: Generate title card
-    card_path = make_title_card(video_path, title)
 
     # Use a system font guaranteed to be on macOS
     font_path = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
@@ -690,37 +722,66 @@ def burn_captions(video_path, ass_path, title, output_path):
 
     safe_ass_path = str(ass_path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
+    # Theme colors
+    theme = COLOR_THEMES.get(COLOR_THEME, COLOR_THEMES["blue"])
+    box_color = theme["box"]
+    text_color = theme["text"]
+    y_pct = TITLE_Y_PERCENT / 100
+
     # Wrap title into multiple lines, stack drawtext filters vertically
-    # Line spacing = fontsize only (no gap), so the boxborderw (20px) overlaps
-    # between lines, creating one connected blue block
-    title_lines = wrap_title(title)
+    words = title.upper().split()
+    title_lines = []
+    current = ""
+    for word in words:
+        if current and len(current) + 1 + len(word) > 14:
+            title_lines.append(current)
+            current = word
+        else:
+            current = f"{current} {word}" if current else word
+    if current:
+        title_lines.append(current)
+
     fontsize = 72
     box_pad = 20
     line_height = fontsize  # boxes overlap by 2*box_pad, looks connected
     total_height = len(title_lines) * line_height
-    base_y = f"(h*0.59)-{total_height // 2}"
+    base_y = f"(h*{y_pct})-{total_height // 2}"
 
+    # Two-pass rendering: draw all boxes first, then all text on top.
+    # Single-pass would let a lower line's box paint over the upper line's text.
     title_filters = ""
     for i, line in enumerate(title_lines):
         safe_line = line.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:").replace("%", "\\%")
         y_expr = f"{base_y}+{i * line_height}"
+        # Pass 1: box only (transparent text)
         title_filters += (
             f",drawtext=text='{safe_line}'"
             f":fontfile='{font_path}'"
-            f":fontcolor=white"
+            f":fontcolor={text_color}@0.0"
             f":fontsize={fontsize}"
             f":x=(w-tw)/2"
             f":y={y_expr}"
             f":box=1"
-            f":boxcolor=#1D8CD7"
+            f":boxcolor={box_color}"
             f":boxborderw={box_pad}"
+            f":enable='between(t,0,5)'"
+        )
+    for i, line in enumerate(title_lines):
+        safe_line = line.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:").replace("%", "\\%")
+        y_expr = f"{base_y}+{i * line_height}"
+        # Pass 2: text only (no box)
+        title_filters += (
+            f",drawtext=text='{safe_line}'"
+            f":fontfile='{font_path}'"
+            f":fontcolor={text_color}"
+            f":fontsize={fontsize}"
+            f":x=(w-tw)/2"
+            f":y={y_expr}"
             f":enable='between(t,0,5)'"
         )
 
     vf = f"ass='{safe_ass_path}'{title_filters}"
 
-    # Step 2: Burn captions into the main video
-    captioned_path = OUTPUT_DIR / f"_captioned_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_path),
@@ -729,7 +790,7 @@ def burn_captions(video_path, ass_path, title, output_path):
         "-c:v", "libx264",
         "-preset", "fast",
         "-crf", "18",
-        str(captioned_path),
+        str(output_path),
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -737,35 +798,6 @@ def burn_captions(video_path, ass_path, title, output_path):
         print("\n  ffmpeg error:")
         print(result.stderr[-2000:])
         sys.exit(1)
-
-    # Step 3: Concatenate title card + captioned video
-    if card_path:
-        concat_list = OUTPUT_DIR / "_concat.txt"
-        with open(concat_list, "w") as f:
-            f.write(f"file '{card_path}'\n")
-            f.write(f"file '{captioned_path}'\n")
-
-        concat_cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", str(concat_list),
-            "-c", "copy",
-            str(output_path),
-        ]
-        result = subprocess.run(concat_cmd, capture_output=True, text=True)
-
-        # Clean up temp files
-        concat_list.unlink(missing_ok=True)
-        card_path.unlink(missing_ok=True)
-        captioned_path.unlink(missing_ok=True)
-
-        if result.returncode != 0:
-            print("\n  ffmpeg concat error:")
-            print(result.stderr[-2000:])
-            sys.exit(1)
-    else:
-        # No title card — just rename captioned as final
-        captioned_path.rename(output_path)
 
     print(f"  ✓ Saved: {output_path.name}")
 
@@ -1202,15 +1234,13 @@ def reprocess():
     print("  Chess Clip Automator — Reprocess Mode")
     print("  ══════════════════════════════════════")
 
-    raw_files = sorted(OUTPUT_DIR.glob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True)
-    # Only show raw downloads (yt_raw_ and trimmed_) not finished outputs
-    raw_files = [f for f in raw_files if f.name.startswith(("yt_raw_", "trimmed_"))]
+    raw_files = sorted(RAW_DIR.glob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True)
 
     if not raw_files:
-        print("\n  No raw .mp4 files found in output/")
+        print("\n  No raw .mp4 files found in output/raw/")
         sys.exit(1)
 
-    print("\n  Raw files in output/ (newest first):\n")
+    print("\n  Raw files (newest first):\n")
     for i, f in enumerate(raw_files):
         print(f"  [{i+1}] {f.name}")
 
@@ -1239,11 +1269,11 @@ def reprocess():
     result = transcribe(video_path)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    ass_path = OUTPUT_DIR / f"{stamp}.ass"
+    ass_path = RAW_DIR / f"{stamp}.ass"
     make_ass(result, ass_path)
 
     output_name = safe_filename(title, datetime.now().strftime("%Y-%m-%d"))
-    output_path = OUTPUT_DIR / f"{output_name}.mp4"
+    output_path = COMPLETED_DIR / f"{output_name}.mp4"
     burn_captions(video_path, ass_path, title, output_path)
 
     print()
@@ -1259,10 +1289,8 @@ def clean():
     print("  Chess Clip Automator — Clean Output")
     print("  ════════════════════════════════════")
 
-    files = sorted(
-        [f for f in OUTPUT_DIR.iterdir() if f.name != ".DS_Store"],
-        key=lambda f: f.stat().st_mtime, reverse=True,
-    )
+    all_files = list(COMPLETED_DIR.glob("*.mp4")) + list(RAW_DIR.glob("*.mp4"))
+    files = sorted(all_files, key=lambda f: f.stat().st_mtime, reverse=True)
     if not files:
         print("\n  Output folder is empty.")
         return
@@ -1297,10 +1325,493 @@ def clean():
     print(f"\n  Removed {len(to_delete)} file(s).")
 
 
+LAUNCHD_LABEL = "com.zaksclips.reminder"
+LAUNCHD_PLIST = Path.home() / "Library/LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+CLIPPER_PATH = Path(__file__).resolve()
+
+
+def send_notification():
+    """Show a macOS dialog with Start/Dismiss. Start launches the clipper in Terminal."""
+    script = f'''
+    set response to display dialog "Clips are ready! Time to process yesterday's stream." ¬
+        with title "ZaksClips" ¬
+        buttons {{"Dismiss", "Start"}} default button "Start" ¬
+        giving up after 3600
+    if button returned of response is "Start" then
+        tell application "Terminal"
+            activate
+            do script "cd \\"{CLIPPER_PATH.parent}\\" && python3 clipper.py"
+        end tell
+    end if
+    '''
+    subprocess.run(["osascript", "-e", script])
+
+
+def schedule(test=False):
+    """Schedule batch processing for 10am daily via launchd.
+    Runs clipper.py --batch headlessly — videos land in the GUI review queue."""
+    if test:
+        print("\n  Running batch process now...")
+        batch_process()
+        return
+
+    python_path = sys.executable  # e.g. /opt/homebrew/bin/python3
+    batch_cmd = f'cd "{CLIPPER_PATH.parent}" && "{python_path}" "{CLIPPER_PATH}" --batch'
+
+    plist = {
+        "Label": LAUNCHD_LABEL,
+        "ProgramArguments": ["/bin/bash", "-c", batch_cmd],
+        "StartCalendarInterval": {
+            "Hour": SCHEDULE_HOUR,
+            "Minute": SCHEDULE_MINUTE,
+        },
+        "StandardOutPath": str(OUTPUT_DIR / "worker.log"),
+        "StandardErrorPath": str(OUTPUT_DIR / "worker.log"),
+        "EnvironmentVariables": {
+            "PATH": "/opt/homebrew/opt/ffmpeg-full/bin:/opt/homebrew/bin:/usr/bin:/bin",
+        },
+        "RunAtLoad": False,
+    }
+
+    # Unload existing if present
+    if LAUNCHD_PLIST.exists():
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(LAUNCHD_PLIST)],
+                        capture_output=True)
+
+    LAUNCHD_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    with open(LAUNCHD_PLIST, "wb") as f:
+        plistlib.dump(plist, f)
+
+    subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(LAUNCHD_PLIST)],
+                    check=True)
+
+    hour_label = f"{SCHEDULE_HOUR % 12 or 12}:{SCHEDULE_MINUTE:02d}{'am' if SCHEDULE_HOUR < 12 else 'pm'}"
+    print(f"\n  ✓ Auto-process scheduled for {hour_label} daily")
+    print(f"    Clips will be processed and queued for review in the app.")
+    print(f"    To cancel: python3 clipper.py --unschedule")
+    print(f"    To test now: python3 clipper.py -s --test")
+
+
+def unschedule():
+    """Remove the scheduled auto-processing job."""
+    if LAUNCHD_PLIST.exists():
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(LAUNCHD_PLIST)],
+                        capture_output=True)
+        LAUNCHD_PLIST.unlink()
+        print("\n  ✓ Auto-process schedule removed.")
+    else:
+        print("\n  No schedule active.")
+
+
+def is_scheduled():
+    """Check if the auto-processing launchd job is installed."""
+    return LAUNCHD_PLIST.exists()
+
+
+# ─── Scheduled posting ──────────────────────────────────────────────────────
+
+POSTER_LAUNCHD_LABEL = "com.zaksclips.poster"
+POSTER_LAUNCHD_PLIST = Path.home() / "Library/LaunchAgents" / f"{POSTER_LAUNCHD_LABEL}.plist"
+
+
+def schedule_poster():
+    """Install a launchd job that runs clipper.py --post hourly."""
+    python_path = sys.executable
+    post_cmd = f'cd "{CLIPPER_PATH.parent}" && "{python_path}" "{CLIPPER_PATH}" --post'
+
+    plist = {
+        "Label": POSTER_LAUNCHD_LABEL,
+        "ProgramArguments": ["/bin/bash", "-c", post_cmd],
+        "StartInterval": 3600,  # every hour
+        "StandardOutPath": str(OUTPUT_DIR / "poster.log"),
+        "StandardErrorPath": str(OUTPUT_DIR / "poster.log"),
+        "EnvironmentVariables": {
+            "PATH": "/opt/homebrew/opt/ffmpeg-full/bin:/opt/homebrew/bin:/usr/bin:/bin",
+        },
+        "RunAtLoad": False,
+    }
+
+    if POSTER_LAUNCHD_PLIST.exists():
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(POSTER_LAUNCHD_PLIST)],
+                        capture_output=True)
+
+    POSTER_LAUNCHD_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    with open(POSTER_LAUNCHD_PLIST, "wb") as f:
+        plistlib.dump(plist, f)
+
+    subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(POSTER_LAUNCHD_PLIST)],
+                    check=True)
+
+
+def unschedule_poster():
+    """Remove the poster launchd job."""
+    if POSTER_LAUNCHD_PLIST.exists():
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(POSTER_LAUNCHD_PLIST)],
+                        capture_output=True)
+        POSTER_LAUNCHD_PLIST.unlink()
+
+
+def is_poster_scheduled():
+    """Check if the poster launchd job is installed."""
+    return POSTER_LAUNCHD_PLIST.exists()
+
+
+def post_scheduled():
+    """Check for scheduled videos that are due and upload them."""
+    import json
+    import logging
+
+    log_path = OUTPUT_DIR / "poster.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_path),
+            logging.StreamHandler(sys.stdout),
+        ],
+        force=True,
+    )
+    log = logging.getLogger("zaksclips.poster")
+
+    meta_path = Path(__file__).parent / ".video_meta.json"
+    if not meta_path.exists():
+        return
+
+    try:
+        meta = json.loads(meta_path.read_text())
+    except Exception:
+        return
+
+    now = datetime.now()
+    posted_count = 0
+
+    for filename, vmeta in list(meta.items()):
+        if vmeta.get("status") != "scheduled":
+            continue
+
+        scheduled_time_str = vmeta.get("scheduled_time", "")
+        if not scheduled_time_str:
+            continue
+
+        try:
+            scheduled_time = datetime.fromisoformat(scheduled_time_str)
+        except ValueError:
+            continue
+
+        if scheduled_time > now:
+            continue  # not due yet
+
+        video_path = COMPLETED_DIR / filename
+        if not video_path.exists():
+            log.warning(f"Scheduled video not found: {filename}")
+            vmeta["status"] = "upload_failed"
+            continue
+
+        title = vmeta.get("title", video_path.stem)
+        caption = vmeta.get("caption", title)
+
+        log.info(f"Posting scheduled video: {title}")
+
+        # Copy to iCloud
+        copy_to_icloud(video_path)
+
+        yt_ok = False
+        tt_ok = False
+
+        if YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET:
+            try:
+                url = upload_to_youtube(video_path, title, caption)
+                if url:
+                    vmeta["youtube"] = True
+                    yt_ok = True
+                    log.info(f"  YouTube: {url}")
+            except Exception as e:
+                vmeta["youtube_failed"] = True
+                log.error(f"  YouTube upload failed: {e}")
+
+        if TIKTOK_CLIENT_KEY:
+            try:
+                publish_id = upload_to_tiktok(video_path, title)
+                if publish_id:
+                    vmeta["tiktok"] = True
+                    tt_ok = True
+                    log.info(f"  TikTok: {publish_id}")
+            except Exception as e:
+                vmeta["tiktok_failed"] = True
+                log.error(f"  TikTok upload failed: {e}")
+
+        if yt_ok or tt_ok:
+            vmeta["status"] = "posted"
+            posted_count += 1
+        else:
+            vmeta["status"] = "upload_failed"
+
+        # Clean up raw file
+        raw_path_str = vmeta.get("raw_path", "")
+        if raw_path_str:
+            Path(raw_path_str).unlink(missing_ok=True)
+
+    meta_path.write_text(json.dumps(meta, indent=2))
+
+    if posted_count > 0:
+        msg = f"{posted_count} scheduled video(s) posted"
+        subprocess.run(["osascript", "-e",
+            f'display notification "{msg}" with title "ZaksClips"'])
+        log.info(msg)
+
+    # If no more scheduled videos, remove the poster job
+    has_scheduled = any(v.get("status") == "scheduled" for v in meta.values())
+    if not has_scheduled and is_poster_scheduled():
+        unschedule_poster()
+        log.info("No more scheduled videos — poster job removed")
+
+
+def batch_process():
+    """Headless batch processing — fetch clips, process all, write metadata for GUI review.
+    No prompts, no uploads. Videos land in the GUI's 'Ready for Review' queue."""
+    import json
+    import logging
+
+    log_path = OUTPUT_DIR / "worker.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_path),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    log = logging.getLogger("zaksclips.batch")
+
+    processed_path = Path(__file__).parent / ".processed_clips.json"
+    meta_path = Path(__file__).parent / ".video_meta.json"
+
+    def load_processed():
+        if processed_path.exists():
+            try:
+                return set(json.loads(processed_path.read_text()))
+            except Exception:
+                return set()
+        return set()
+
+    def save_processed(ids):
+        processed_path.write_text(json.dumps(list(ids)))
+
+    def load_meta():
+        if meta_path.exists():
+            try:
+                return json.loads(meta_path.read_text())
+            except Exception:
+                return {}
+        return {}
+
+    def save_meta(meta):
+        meta_path.write_text(json.dumps(meta, indent=2))
+
+    # Platform guard
+    if PLATFORM != "youtube":
+        log.error(f"Batch mode requires PLATFORM=youtube (current: {PLATFORM})")
+        return
+
+    if not all([TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_USERNAME]):
+        log.error("Missing Twitch credentials in .env")
+        return
+
+    if not YOUTUBE_API_KEY or not YOUTUBE_CHANNEL_HANDLE:
+        log.error("Missing YOUTUBE_API_KEY or YOUTUBE_CHANNEL_HANDLE in .env")
+        return
+
+    # Fetch clips
+    log.info(f"Fetching clips for @{TWITCH_USERNAME}...")
+    try:
+        token = get_twitch_token()
+        user_id = get_user_id(token)
+    except SystemExit:
+        log.error("Failed to authenticate with Twitch. Check credentials.")
+        return
+
+    clips = get_recent_clips(token, user_id)
+    if not clips:
+        log.info("No clips found.")
+        return
+
+    processed_ids = load_processed()
+    new_clips = [c for c in clips if c["id"] not in processed_ids and c.get("vod_offset") is not None]
+
+    if not new_clips:
+        log.info("No new clips to process.")
+        return
+
+    log.info(f"Found {len(new_clips)} new clip(s) to process")
+
+    # Get YouTube channel ID once
+    try:
+        channel_id = get_youtube_channel_id()
+    except SystemExit:
+        log.error("YouTube channel not found. Check YOUTUBE_CHANNEL_HANDLE.")
+        return
+
+    success_count = 0
+    fail_count = 0
+
+    for clip in new_clips:
+        try:
+            log.info(f"Processing: {clip['title']}")
+
+            vod_end = clip["vod_offset"] + clip["duration"]
+            seg_start = max(0, vod_end - int(CLIP_LENGTH * 60))
+            seg_end = vod_end
+
+            # 1. Find and download VOD segment
+            vods = find_youtube_vod(channel_id, clip["created_at"])
+            if not vods:
+                log.warning(f"No YouTube VOD found for clip date {clip['created_at'][:10]} — skipping")
+                continue
+
+            clip_dt = datetime.fromisoformat(clip["created_at"].replace("Z", "+00:00"))
+            best = min(vods, key=lambda v: abs(
+                (datetime.fromisoformat(v["snippet"]["publishedAt"].replace("Z", "+00:00")) - clip_dt).total_seconds()))
+            vod_url = f"https://www.youtube.com/watch?v={best['id']['videoId']}"
+            log.info(f"  VOD: {best['snippet']['title']}")
+
+            def to_yt_ts(s):
+                s = int(s)
+                h, r = divmod(s, 3600)
+                m, sec = divmod(r, 60)
+                return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+            stamp = datetime.now().strftime("%m-%d_%H%M")
+            video_path = RAW_DIR / f"yt_raw_{stamp}.mp4"
+            section = f"*{to_yt_ts(seg_start)}-{to_yt_ts(seg_end)}"
+
+            cmd = ["yt-dlp", "--download-sections", section,
+                   "--merge-output-format", "mp4", "-o", str(video_path), vod_url]
+            result = subprocess.run(cmd, text=True, capture_output=True)
+            if result.returncode != 0:
+                log.error(f"  yt-dlp failed: {result.stderr[:200]}")
+                continue
+
+            log.info(f"  Downloaded: {video_path.name}")
+
+            # 2. Transcribe
+            whisper_result = transcribe(video_path)
+
+            # 3. AI title & caption
+            transcript_text = get_transcript_text(whisper_result)
+            ai_title, ai_caption = None, None
+            if ANTHROPIC_API_KEY:
+                ai_title, ai_caption = generate_title_caption(transcript_text, clip["title"])
+
+            title = ai_title or clip["title"]
+            caption = ai_caption or title
+
+            # 4. Generate subtitles & burn captions
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ass_path = RAW_DIR / f"{ts}.ass"
+            make_ass(whisper_result, ass_path)
+
+            output_name = safe_filename(title, clip["created_at"])
+            output_path = COMPLETED_DIR / f"{output_name}.mp4"
+            burn_captions(video_path, ass_path, title, output_path)
+
+            ass_path.unlink(missing_ok=True)
+            for p in RAW_DIR.glob("*.part"):
+                p.unlink(missing_ok=True)
+
+            log.info(f"  Ready: {output_path.name}")
+
+            # 5. Write metadata
+            meta = load_meta()
+            video_meta = {
+                "date": clip["created_at"][:10],
+                "mode": CLIP_MODE,
+                "raw_path": str(video_path),
+                "title": title,
+                "caption": caption,
+                "clip_id": clip["id"],
+            }
+
+            if CLIP_MODE == "auto-post":
+                # Auto-upload and copy to iCloud
+                copy_to_icloud(output_path)
+                log.info(f"  Copied to iCloud")
+
+                yt_ok = False
+                if YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET:
+                    try:
+                        url = upload_to_youtube(output_path, title, caption)
+                        if url:
+                            video_meta["youtube"] = True
+                            log.info(f"  YouTube: {url}")
+                            yt_ok = True
+                    except Exception as e:
+                        log.error(f"  YouTube upload failed: {e}")
+
+                tt_ok = False
+                if TIKTOK_CLIENT_KEY:
+                    try:
+                        publish_id = upload_to_tiktok(output_path, title)
+                        if publish_id:
+                            video_meta["tiktok"] = True
+                            log.info(f"  TikTok: {publish_id}")
+                            tt_ok = True
+                    except Exception as e:
+                        log.error(f"  TikTok upload failed: {e}")
+
+                video_meta["status"] = "posted" if (yt_ok or tt_ok) else "upload_failed"
+
+                # Clean up raw file after auto-post
+                video_path.unlink(missing_ok=True)
+            else:
+                # Auto mode — queue for review, keep raw file
+                video_meta["status"] = "ready_for_review"
+
+            meta[output_path.name] = video_meta
+            save_meta(meta)
+
+            processed_ids.add(clip["id"])
+            save_processed(processed_ids)
+
+            success_count += 1
+
+        except SystemExit:
+            log.error(f"  System exit during processing of '{clip['title']}' — skipping")
+            fail_count += 1
+        except Exception as e:
+            log.exception(f"  Failed to process '{clip['title']}': {e}")
+            fail_count += 1
+
+    # Notify user
+    if success_count > 0:
+        msg = f"{success_count} video(s) ready for review"
+        if fail_count:
+            msg += f", {fail_count} failed"
+        subprocess.run(["osascript", "-e",
+            f'display notification "{msg}" with title "ZaksClips"'])
+
+    log.info(f"Batch complete: {success_count} processed, {fail_count} failed")
+
+
 def main():
     print()
     print("  Chess Clip Automator")
     print("  ════════════════════")
+
+    if "--batch" in sys.argv or "-b" in sys.argv:
+        batch_process()
+        return
+
+    if "--post" in sys.argv:
+        post_scheduled()
+        return
+
+    if "--schedule" in sys.argv or "-s" in sys.argv:
+        schedule(test="--test" in sys.argv)
+        return
+
+    if "--unschedule" in sys.argv:
+        unschedule()
+        return
 
     if "--clean" in sys.argv or "-c" in sys.argv:
         clean()
@@ -1334,7 +1845,7 @@ def main():
         print(f"  ══ {clip['title']} ══")
 
         vod_end = clip["vod_offset"] + clip["duration"]
-        seg_start = max(0, vod_end - 120)
+        seg_start = max(0, vod_end - int(CLIP_LENGTH * 60))
         seg_end = vod_end
 
         # 1. Download segment
@@ -1360,12 +1871,12 @@ def main():
 
         # 5. Generate subtitles
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        ass_path = OUTPUT_DIR / f"{stamp}.ass"
+        ass_path = RAW_DIR / f"{stamp}.ass"
         make_ass(result, ass_path)
 
         # 6. Burn in
         output_name = safe_filename(title, clip["created_at"])
-        output_path = OUTPUT_DIR / f"{output_name}.mp4"
+        output_path = COMPLETED_DIR / f"{output_name}.mp4"
         burn_captions(video_path, ass_path, title, output_path)
 
         print()

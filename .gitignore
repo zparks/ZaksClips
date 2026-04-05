@@ -6,6 +6,14 @@
 # Browser session data
 .browser_session/
 
+# Processed clip tracking
+.processed_clips.json
+.video_meta.json
+.worker.lock
+
+# Claude Code
+.claude/
+
 # Python
 venv/
 __pycache__/

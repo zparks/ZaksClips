@@ -10,27 +10,114 @@ Automates the post-stream clip workflow for a chess streamer. Repo: github.com/z
 4. Opens raw video for preview — user can adjust segment timing (+/- start/end)
 5. Prompts for title and description/caption
 6. Transcribes audio with Whisper (MLX, runs on M4)
-7. Generates 0.5s title card + burns styled captions into the video with ffmpeg
+7. Burns styled captions and title overlay into the video with ffmpeg
 8. Copies finished video to iCloud Drive for phone access
 9. Optionally uploads to YouTube Shorts and/or TikTok (each with explicit confirmation)
 10. If upload fails, shows message to post from iCloud Drive on phone
 
+## GUI (`python3 gui.py`)
+
+Full desktop app wrapping clipper.py with customtkinter (dark mode).
+
+### Home screen = My Videos
+- No tabs — My Videos is the main screen, "Get Clips" opens the manual flow as an overlay
+- Three sections: **Active** (drafts/approved/failed — always visible), **Scheduled** (expanded by default, collapsible), **Posted** (collapsed by default, expandable)
+- Each video card shows: title, date/size/auto tag, progress dots (● Processed → ● Approved → ● Posted)
+- Progress dot states: green ● = done, orange ● = needs attention, ◷ = scheduled (blue, shows date/time), ✕ = failed (red)
+- Buttons adapt by status: "Review" (orange) for unreviewed, "Edit" (gray) for approved/scheduled, "Unschedule" (red) + "Edit" for scheduled
+- "Get Clips" button adapts: prominent blue in off mode, gray "Get Clips Manually" in auto/auto-post mode
+- Empty state adapts: big "Get Clips" CTA in off mode, "your clips will be processed at Xam" + "Process Now" in auto mode
+
+### Schedule modes (top bar selector: off | auto | auto-post)
+- **off** — no schedule, manual workflow only
+- **auto** — batch processes clips daily, queues for review in My Videos (soft green banner)
+- **auto-post** — batch processes AND uploads automatically (red danger banner)
+- Time picker (hour + minute in 5-min increments) appears inline next to selector when auto/auto-post
+- Schedule saved to `.env` as `SCHEDULE_HOUR` and `SCHEDULE_MINUTE`, launchd job auto-managed
+
+### Processing flow (Get Clips overlay)
+- Fetch clips → select (already-processed shown as "(already in My Videos)", unchecked by default) → process
+- Steps are display-only progress bar (not clickable)
+- Always interactive: trim → title → caption → burn → preview+edit → upload
+- Preview+edit screen (`_preview_and_approve`): video player, editable title/caption, color theme picker, position sliders, re-burn, "Save as Default"
+- Buttons: "Looks Good" → "Save for Later" → "Re-trim" → "Discard"
+- After "Looks Good": "Upload Now" / "Schedule Post" / "Not Now"
+- Schedule Post: date picker (14 days) + hour/30min time picker
+- Returns to My Videos when done
+
+### Review/Edit flow (from My Videos)
+- Uses the same `_preview_and_approve` screen as processing — full editing capabilities
+- Buttons adapt: "Close" normally, "Unschedule" for scheduled videos
+- Re-burn uses raw file (never burns on top of already-burned output)
+- On approve → upload choice → iCloud copy + upload + raw cleanup
+
+### Video metadata (`.video_meta.json`)
+- Tracks per-video: status, date, mode, title, caption, raw_path, youtube/tiktok flags, scheduled_time
+- Statuses: `ready_for_review`, `approved`, `needs_upload`, `scheduled`, `posted`, `upload_failed`
+- Written by both GUI and batch processor
+
+### Other GUI features
+- Embedded video player with synced audio (PyAV + sounddevice)
+- All dialogs are inline overlays (`_show_overlay`/`_hide_overlay`)
+- Help button: renders README.md inline
+- Settings hot-reloads .env into clipper globals
+- Escape closes overlays or cancels processing
+- .app launcher at ~/Applications/ZaksClips.app (launches GUI directly)
+- Deps: customtkinter, python-tk@3.14, av (PyAV), sounddevice, numpy, Pillow
+
+### File organization
+- `output/raw/` — downloads and trims (kept until user approves in review)
+- `output/completed/` — finished captioned files
+- iCloud copy happens on upload (not during batch processing)
+- .ass and .part files auto-deleted after processing
+- Raw files deleted after approval+upload; kept for re-trimming during review
+
 ## CLI commands
 
-- `python3 clipper.py` — normal flow
+- `python3 clipper.py` — normal interactive flow
+- `python3 clipper.py --batch` or `-b` — headless batch processing. Requires PLATFORM=youtube.
+- `python3 clipper.py --post` — check for scheduled posts that are due and upload them
 - `python3 clipper.py -r` — reprocess existing raw video (skip download)
 - `python3 clipper.py -c` — clean/manage output folder
+- `python3 clipper.py -s` — schedule auto-processing via launchd (runs `--batch` at configured time)
+- `python3 clipper.py --unschedule` — cancel scheduled auto-processing
+- `python3 clipper.py -s --test` — run batch processing immediately
+- **Dock icon** — `~/Applications/ZaksClips.app` opens the GUI directly
+
+## Batch processing (`--batch`)
+
+- Runs headlessly — no terminal interaction needed
+- Fetches clips, skips already-processed ones (`.processed_clips.json`)
+- Downloads VOD via YouTube, transcribes with Whisper, generates AI title/caption
+- Burns captions, writes to `.video_meta.json` with `status: "ready_for_review"`
+- Does NOT copy to iCloud or delete raw files (user approves in GUI review)
+- In `auto-post` mode: also uploads and copies to iCloud automatically
+- Sends macOS notification when done
+- Logs to `output/worker.log`
+- Scheduled via GUI mode selector or `python3 clipper.py -s` (launchd: `com.zaksclips.reminder`)
+
+## Scheduled posting (`--post`)
+
+- Hourly launchd job (`com.zaksclips.poster`) checks `.video_meta.json` for `status: "scheduled"` videos
+- Uploads videos whose `scheduled_time` has passed, copies to iCloud, updates status to `posted`
+- Auto-installs when a video is scheduled, auto-removes when no scheduled videos remain
+- Sends macOS notification when posts go out
+- Logs to `output/poster.log`
 
 ## Stack
 
 - Python 3 — packages installed to system Python via `pip3 install --user --break-system-packages` (NOT using the venv)
 - `mlx-whisper` — Apple Silicon optimized Whisper large-v3, ~10-15s per clip
 - `playwright` — persistent Chromium session for TikTok Live Center
-- `ffmpeg` — burns captions (ASS format), title overlay, title card, and local trimming
+- `ffmpeg` — burns captions (ASS format), title overlay, and local trimming
 - `google-api-python-client` + `google-auth-oauthlib` — YouTube Shorts upload via OAuth2
 - Twitch Helix API — fetches clips and VOD offsets
 - YouTube Data API v3 — VOD lookup and Shorts upload
 - TikTok Content Posting API — direct upload via OAuth2 + PKCE
+- `customtkinter` — GUI framework (dark mode)
+- `av` (PyAV) — video frame decoding for embedded preview
+- `Pillow` — PIL image conversion for tkinter display
+- `sounddevice` + `numpy` — audio playback in embedded preview (synced with PyAV demux)
 - No paid services, runs entirely local
 
 ## Key decisions
@@ -42,7 +129,6 @@ Automates the post-stream clip workflow for a chess streamer. Repo: github.com/z
 - **Day-by-day clip fetching** — Twitch Helix clips endpoint sorts by views on wide date ranges and drops low-view clips. Fetching day-by-day ensures all clips are found.
 - **YouTube VOD matching checks day before** — streams that start before midnight UTC produce clips timestamped the next day. VOD search matches both the clip date and the previous day.
 - **Local trimming** — when shortening a segment (-N or e-N), ffmpeg crops locally instead of re-downloading. Only extends (+N or e+N) trigger a re-download.
-- **Title card for YouTube thumbnail** — 0.5s black frame with title at video start so YouTube grabs it as the Shorts thumbnail.
 - **iCloud Drive sync** — finished videos auto-copy to `~/Library/Mobile Documents/com~apple~CloudDocs/ZaksClips/` for phone access via Files app.
 
 ## Segment adjustment
@@ -57,16 +143,15 @@ After downloading, user can adjust timing before captions are burned:
 
 ## Caption & title styling
 
-- **Captions position** — 35% up from bottom (`MarginV=672` on 1920px canvas)
+- **7 color themes** — Classic White, Classic Black, Electric Blue (default), Fire Red, Neon Green, Royal Purple, Gold. Stored as `COLOR_THEME` in `.env`. Theme color applies to both title box and caption outline. Text color auto-picks black or white for contrast.
+- **Adjustable positions** — `TITLE_Y_PERCENT` (default 59) and `CAPTION_Y_PERCENT` (default 65) control vertical placement as % from top. Configurable via sliders in both the preview/edit screen and Settings.
+- **Per-clip style controls** — Color theme, title height, and caption height are editable on the preview/approve screen. Changing any triggers the "Re-burn" button. "Save as Default" persists style to `.env` for future clips. Settings page still shows/edits defaults.
 - **Captions are one line max** — Whisper word-level timestamps chunked at ~30 chars, no long wrapping segments
 - **No punctuation in captions** — commas, periods, etc. stripped via regex
 - **All caps** — both captions and title are uppercased
 - **Title shows first 5 seconds only** — `enable='between(t,0,5)'` on drawtext, acts as thumbnail text
-- **Title wraps** — long titles auto-wrap at ~14 chars per line, stacked vertically with overlapping blue boxes so they appear as one connected block
-- **Title position** — centered vertically around `y=h*0.59`, sits over the captions for the first 5 seconds
-- **Title background** — solid blue `#1D8CD7` (between sky and electric blue), `boxborderw=20`, lines spaced at fontsize only so boxes overlap and merge
+- **Title wraps** — long titles auto-wrap at ~14 chars per line, stacked vertically with overlapping boxes so they appear as one connected block. Two-pass ffmpeg rendering (boxes first, then text) prevents lower boxes from covering upper text.
 - **Font** — Arial Bold from macOS system fonts, fontsize 72 for title, 88 for captions
-- **Title card** — 0.5s black frame with title prepended to video for YouTube thumbnail
 
 ## Output file naming
 
@@ -84,6 +169,7 @@ ZaksClips/
 ├── .browser_session/     — saved TikTok login session
 ├── .youtube_token.json   — saved YouTube OAuth2 token (auto-refreshes)
 ├── .tiktok_token.json    — saved TikTok OAuth2 token (auto-refreshes)
+├── .processed_clips.json — tracks which clip IDs have been processed (green "done" label)
 ├── output/               — finished .mp4s land here
 └── docs/                 — GitHub Pages site (ToS, privacy, icon, TikTok verification)
 ```
@@ -146,7 +232,13 @@ Requires:
 - Chunked upload: files under 64MB upload as single chunk; larger files use 10MB chunks
 - 5MB minimum chunk size only applies to non-final chunks in multi-chunk uploads
 
-## Potential improvements not yet built
+## AI title & caption generation
 
-- Auto-generate title from Whisper transcript using an LLM
-- Watch for new clips automatically after a stream ends
+- Uses Claude Haiku (`claude-haiku-4-5-20251001`) via `ANTHROPIC_API_KEY` in `.env`
+- After Whisper transcribes, sends transcript to Claude to generate a punchy ALL CAPS title and a quirky caption ending with #chess
+- `clipper.generate_title_caption(transcript_text, clip_title)` returns `(title, caption)` or `(None, None)` if no API key
+- `clipper.get_transcript_text(whisper_result)` extracts plain text from Whisper result
+- In normal mode: AI title/caption become the default suggestion in the title/caption dialogs (user can override)
+- In danger mode: AI title/caption are used automatically with no prompts
+- Falls back to Twitch clip title if no API key or if generation fails
+- `anthropic` package installed via pip (not in venv)
