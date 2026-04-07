@@ -5,41 +5,57 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ZaksClips</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; color: #e0e0e0; background: #111; }
+    body { font-family: system-ui, sans-serif; max-width: 700px; margin: 60px auto; padding: 0 20px; color: #e0e0e0; background: #111; }
     h1 { font-size: 1.5rem; }
     h2 { font-size: 1.15rem; margin-top: 2rem; }
     a { color: #6cb4ee; }
     p, li { line-height: 1.6; }
-    ul { padding-left: 1.2rem; }
-    code { background: #222; padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }
+    ul, ol { padding-left: 1.2rem; }
+    img { max-width: 100%; border-radius: 8px; margin: 1.5rem 0; border: 1px solid #333; }
+    .links { margin-top: 2rem; padding-top: 1rem; border-top: 1px solid #333; }
   </style>
 </head>
 <body>
   <h1>ZaksClips</h1>
-  <p>A personal desktop tool that automates the post-stream clip workflow for a chess content creator. It runs entirely on the creator's local machine — no server, no cloud, no multi-user access.</p>
+  <p>A desktop app that automates the post-stream clip workflow for chess content creators. Built for personal use — runs entirely on your local machine with no server or cloud backend.</p>
 
-  <h2>How it works</h2>
+  <img src="screenshot.png" alt="ZaksClips app screenshot showing the My Videos screen with processed clips, drafts, and posted videos">
+
+  <h2>What it does</h2>
   <ol>
-    <li>Fetches recent clips from the Twitch API</li>
-    <li>Downloads the corresponding VOD segment from YouTube</li>
-    <li>Transcribes audio locally using Whisper (Apple Silicon)</li>
+    <li>Fetches your recent clips from the Twitch API (day-by-day to catch every clip)</li>
+    <li>Finds the matching YouTube VOD and downloads the segment around each clip</li>
+    <li>Transcribes audio locally using Whisper on Apple Silicon</li>
+    <li>Generates a title and caption using AI, trained on the creator's voice and style</li>
     <li>Burns styled captions and a title overlay onto the video with ffmpeg</li>
-    <li>Uploads the finished video to YouTube Shorts and/or TikTok — only when the creator explicitly confirms</li>
+    <li>Queues videos for review — or uploads automatically on a schedule</li>
+    <li>Uploads to YouTube Shorts and TikTok with explicit confirmation</li>
   </ol>
 
-  <h2>Why TikTok access is needed</h2>
-  <p>ZaksClips uses the TikTok Content Posting API to upload finished videos directly to the creator's own TikTok account. The app never accesses any other user's account or data. Every upload requires explicit confirmation before it is sent.</p>
-
-  <h2>Permissions used</h2>
+  <h2>Features</h2>
   <ul>
-    <li><code>video.upload</code> — upload video files to the creator's account</li>
-    <li><code>video.publish</code> — publish uploaded videos to the creator's profile</li>
+    <li><strong>Schedule modes</strong> — off (manual only), auto (batch process daily, review before posting), or auto-post (fully automatic)</li>
+    <li><strong>Video review</strong> — preview with embedded player, edit title/caption, adjust caption styling and colors, re-trim, re-burn</li>
+    <li><strong>Drafts</strong> — shelve clips you're not sure about without deleting them</li>
+    <li><strong>Scheduled posting</strong> — pick a date and time, the app uploads automatically when it's due</li>
+    <li><strong>AI voice learning</strong> — the AI learns your style over time from what you post and what you reject</li>
+    <li><strong>7 color themes</strong> — separate title and caption colors, adjustable positions</li>
+    <li><strong>iCloud sync</strong> — finished videos auto-copy to iCloud Drive for posting from your phone</li>
   </ul>
-  <p>No other TikTok data is read or modified. The app does not access followers, comments, analytics, or any other user's content.</p>
+
+  <h2>Stack</h2>
+  <ul>
+    <li>Python 3 + customtkinter (dark mode GUI)</li>
+    <li>mlx-whisper (Apple Silicon optimized transcription)</li>
+    <li>ffmpeg (caption burning, title overlays, trimming)</li>
+    <li>Twitch Helix API, YouTube Data API v3, TikTok Content Posting API</li>
+    <li>Claude Haiku (AI title and caption generation)</li>
+    <li>No paid services beyond the AI — everything runs locally</li>
+  </ul>
 
   <h2>Developer</h2>
-  <p>ZaksClips is built and used by a single developer for personal content creation. Source code is available at <a href="https://github.com/zparks/ZaksClips">github.com/zparks/ZaksClips</a>.</p>
+  <p>Built and used by a single developer for personal chess content creation. Source code: <a href="https://github.com/zparks/ZaksClips">github.com/zparks/ZaksClips</a></p>
 
-  <p><a href="terms.html">Terms of Service</a> · <a href="privacy.html">Privacy Policy</a></p>
+  <p class="links"><a href="terms.html">Terms of Service</a> · <a href="privacy.html">Privacy Policy</a></p>
 </body>
 </html>
