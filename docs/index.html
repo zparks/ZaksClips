@@ -7,13 +7,39 @@
   <style>
     body { font-family: system-ui, sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; color: #e0e0e0; background: #111; }
     h1 { font-size: 1.5rem; }
+    h2 { font-size: 1.15rem; margin-top: 2rem; }
     a { color: #6cb4ee; }
-    p { line-height: 1.6; }
+    p, li { line-height: 1.6; }
+    ul { padding-left: 1.2rem; }
+    code { background: #222; padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }
   </style>
 </head>
 <body>
   <h1>ZaksClips</h1>
-  <p>A personal tool that automates the post-stream clip workflow for chess content creators. Fetches Twitch clips, transcribes audio, burns styled captions, and uploads to YouTube Shorts and TikTok.</p>
+  <p>A personal desktop tool that automates the post-stream clip workflow for a chess content creator. It runs entirely on the creator's local machine — no server, no cloud, no multi-user access.</p>
+
+  <h2>How it works</h2>
+  <ol>
+    <li>Fetches recent clips from the Twitch API</li>
+    <li>Downloads the corresponding VOD segment from YouTube</li>
+    <li>Transcribes audio locally using Whisper (Apple Silicon)</li>
+    <li>Burns styled captions and a title overlay onto the video with ffmpeg</li>
+    <li>Uploads the finished video to YouTube Shorts and/or TikTok — only when the creator explicitly confirms</li>
+  </ol>
+
+  <h2>Why TikTok access is needed</h2>
+  <p>ZaksClips uses the TikTok Content Posting API to upload finished videos directly to the creator's own TikTok account. The app never accesses any other user's account or data. Every upload requires explicit confirmation before it is sent.</p>
+
+  <h2>Permissions used</h2>
+  <ul>
+    <li><code>video.upload</code> — upload video files to the creator's account</li>
+    <li><code>video.publish</code> — publish uploaded videos to the creator's profile</li>
+  </ul>
+  <p>No other TikTok data is read or modified. The app does not access followers, comments, analytics, or any other user's content.</p>
+
+  <h2>Developer</h2>
+  <p>ZaksClips is built and used by a single developer for personal content creation. Source code is available at <a href="https://github.com/zparks/ZaksClips">github.com/zparks/ZaksClips</a>.</p>
+
   <p><a href="terms.html">Terms of Service</a> · <a href="privacy.html">Privacy Policy</a></p>
 </body>
 </html>
