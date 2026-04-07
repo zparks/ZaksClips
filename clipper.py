@@ -7,6 +7,7 @@ at the right moment, then transcribes + burns captions and title into the video.
 
 import os
 import sys
+import json
 import time
 import plistlib
 import subprocess
@@ -54,7 +55,9 @@ COLOR_THEMES = {
     "gold":   {"name": "Gold",           "box": "#FFB800", "text": "#000000"},
 }
 COLOR_THEME_ORDER = ["white", "black", "blue", "red", "green", "purple", "gold"]
-COLOR_THEME = os.getenv("COLOR_THEME", "blue")
+COLOR_THEME = os.getenv("COLOR_THEME", "blue")  # legacy fallback
+TITLE_COLOR_THEME = os.getenv("TITLE_COLOR_THEME", "") or os.getenv("COLOR_THEME", "blue")
+CAPTION_COLOR_THEME = os.getenv("CAPTION_COLOR_THEME", "") or os.getenv("COLOR_THEME", "blue")
 TITLE_Y_PERCENT = float(os.getenv("TITLE_Y_PERCENT", "59"))
 CAPTION_Y_PERCENT = float(os.getenv("CAPTION_Y_PERCENT", "65"))
 
@@ -83,6 +86,20 @@ def safe_filename(title, date_str):
     clean = re.sub(r'\s+', '_', clean)
     month_day = date_str[5:10]  # "03-29" from "2026-03-29"
     return f"{clean}_{month_day}"
+
+
+def unique_output_path(directory, base_name, ext=".mp4"):
+    """Return a path that doesn't collide with existing files.
+    e.g. Title_03-29.mp4 → Title_03-29_2.mp4 → Title_03-29_3.mp4"""
+    path = directory / f"{base_name}{ext}"
+    if not path.exists():
+        return path
+    counter = 2
+    while True:
+        path = directory / f"{base_name}_{counter}{ext}"
+        if not path.exists():
+            return path
+        counter += 1
 
 
 def fmt_time(seconds):
@@ -246,10 +263,13 @@ def trim_video(video_path, trim_start_secs, trim_end_secs):
     stamp = datetime.now().strftime("%m-%d_%H%M")
     trimmed_path = RAW_DIR / f"trimmed_{stamp}.mp4"
 
-    cmd = ["ffmpeg", "-y", "-i", str(video_path)]
+    # Put -ss before -i for fast seek, then use re-encode for frame-accurate cuts
+    cmd = ["ffmpeg", "-y"]
 
     if trim_start_secs > 0:
         cmd += ["-ss", str(trim_start_secs)]
+    cmd += ["-i", str(video_path)]
+
     if trim_end_secs > 0:
         # Get duration and subtract trim from end
         probe = subprocess.run(
@@ -264,7 +284,8 @@ def trim_video(video_path, trim_start_secs, trim_end_secs):
             return video_path
         cmd += ["-t", str(new_duration)]
 
-    cmd += ["-c", "copy", str(trimmed_path)]
+    # Re-encode for frame-accurate trimming (stream copy cuts at keyframes only)
+    cmd += ["-preset", "fast", "-crf", "18", "-avoid_negative_ts", "make_zero", str(trimmed_path)]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -519,13 +540,14 @@ def download_from_youtube(seg_start, seg_end, clip=None):
             return f"{h}:{m:02d}:{sec:02d}"
         return f"{m}:{sec:02d}"
 
-    stamp = datetime.now().strftime("%m-%d_%H%M")
+    stamp = datetime.now().strftime("%m-%d_%H%M%S")
     output_path = RAW_DIR / f"yt_raw_{stamp}.mp4"
     section = f"*{to_yt_ts(yt_start)}-{to_yt_ts(yt_end)}"
 
     cmd = [
         "yt-dlp",
         "--download-sections", section,
+        "--force-keyframes-at-cuts",
         "--merge-output-format", "mp4",
         "-o", str(output_path),
         vod_url,
@@ -533,8 +555,18 @@ def download_from_youtube(seg_start, seg_end, clip=None):
 
     result = subprocess.run(cmd, text=True)
     if result.returncode != 0:
-        print("\n  yt-dlp failed — check the URL and try again.")
-        sys.exit(1)
+        print("\n  Retrying without --force-keyframes-at-cuts...")
+        cmd = [
+            "yt-dlp",
+            "--download-sections", section,
+            "--merge-output-format", "mp4",
+            "-o", str(output_path),
+            vod_url,
+        ]
+        result = subprocess.run(cmd, text=True)
+        if result.returncode != 0:
+            print("\n  yt-dlp failed — check the URL and try again.")
+            sys.exit(1)
 
     print(f"\n  ✓ Downloaded: {output_path.name}")
     return output_path
@@ -566,6 +598,107 @@ def transcribe(video_path):
     return result
 
 
+def save_whisper_result(video_path, result):
+    """Save Whisper result to a JSON file alongside the video."""
+    out = Path(video_path).with_suffix(".whisper.json")
+    out.write_text(json.dumps(result, ensure_ascii=False))
+    return out
+
+
+def load_whisper_result(video_path):
+    """Load saved Whisper result for a video. Returns None if not found."""
+    out = Path(video_path).with_suffix(".whisper.json")
+    if out.exists():
+        try:
+            return json.loads(out.read_text())
+        except Exception:
+            pass
+    return None
+
+
+def trim_whisper_result(result, trim_start, trim_end_from_tail, total_duration):
+    """Trim a Whisper result to a new time range by filtering and shifting timestamps.
+    trim_start: seconds cut from the beginning
+    trim_end_from_tail: seconds cut from the end
+    total_duration: original video duration in seconds
+    Returns a new result dict with adjusted timestamps."""
+    if trim_start == 0 and trim_end_from_tail == 0:
+        return result
+    new_end = total_duration - trim_end_from_tail
+    new_segments = []
+    for seg in result.get("segments", []):
+        # Skip segments entirely outside the new range
+        if seg["end"] <= trim_start or seg["start"] >= new_end:
+            continue
+        new_seg = dict(seg)
+        new_seg["start"] = max(0, seg["start"] - trim_start)
+        new_seg["end"] = min(new_end - trim_start, seg["end"] - trim_start)
+        if "words" in seg:
+            new_words = []
+            for w in seg["words"]:
+                ws = w.get("start", seg["start"])
+                we = w.get("end", seg["end"])
+                if we <= trim_start or ws >= new_end:
+                    continue
+                new_w = dict(w)
+                new_w["start"] = max(0, ws - trim_start)
+                new_w["end"] = min(new_end - trim_start, we - trim_start)
+                new_words.append(new_w)
+            new_seg["words"] = new_words
+        new_segments.append(new_seg)
+    return {"segments": new_segments, "text": result.get("text", "")}
+
+
+def _read_voice_file():
+    """Read voice.txt if it exists, return contents or empty string."""
+    voice_path = Path(__file__).parent / "voice.txt"
+    if voice_path.exists():
+        try:
+            return voice_path.read_text().strip()
+        except Exception:
+            return ""
+    return ""
+
+
+def log_to_voice(title, caption):
+    """Append a posted title+caption to voice.txt."""
+    voice_path = Path(__file__).parent / "voice.txt"
+    try:
+        content = voice_path.read_text() if voice_path.exists() else ""
+        # Find the Posted Titles section and append
+        title_marker = "## Posted Titles (burned-in overlay)"
+        caption_marker = "## Posted Captions (YouTube/TikTok)"
+        if title and title_marker in content:
+            idx = content.index(caption_marker)
+            content = content[:idx] + f"- {title.upper()}\n" + content[idx:]
+        if caption and caption_marker in content:
+            rejected_marker = "## Rejected"
+            idx = content.index(rejected_marker)
+            content = content[:idx] + f"- {caption}\n" + content[idx:]
+        voice_path.write_text(content)
+        print(f"  ✓ Logged to voice.txt")
+    except Exception as e:
+        print(f"  Could not log to voice.txt: {e}")
+
+
+def log_rejection_to_voice(ai_title, user_title, ai_caption, user_caption):
+    """Log rejected AI suggestions to voice.txt so the AI learns what NOT to do."""
+    voice_path = Path(__file__).parent / "voice.txt"
+    try:
+        content = voice_path.read_text() if voice_path.exists() else ""
+        lines = []
+        if ai_title and user_title and ai_title.upper() != user_title.upper():
+            lines.append(f"- TITLE: \"{ai_title}\" -> \"{user_title}\"")
+        if ai_caption and user_caption and ai_caption.strip() != user_caption.strip():
+            lines.append(f"- CAPTION: \"{ai_caption}\" -> \"{user_caption}\"")
+        if lines:
+            content = content.rstrip() + "\n" + "\n".join(lines) + "\n"
+            voice_path.write_text(content)
+            print(f"  ✓ Logged rejection(s) to voice.txt")
+    except Exception as e:
+        print(f"  Could not log rejection to voice.txt: {e}")
+
+
 def generate_title_caption(transcript_text, clip_title=""):
     """Use Claude to generate a title and caption from the transcript.
     Returns (title, caption) or (None, None) if unavailable."""
@@ -577,8 +710,17 @@ def generate_title_caption(transcript_text, clip_title=""):
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-        prompt = f"""You are writing a title and caption for a chess TikTok/YouTube Short.
+        voice_guide = _read_voice_file()
+        voice_section = f"""
+Here is the creator's voice and brand guide — match this style closely:
+---
+{voice_guide}
+---
 
+""" if voice_guide else ""
+
+        prompt = f"""You are writing a title and caption for a chess TikTok/YouTube Short.
+{voice_section}
 Here is the transcript of the clip:
 {transcript_text[:3000]}
 
@@ -586,9 +728,11 @@ Here is the transcript of the clip:
 
 Generate TWO things:
 
-1. TITLE: A short, punchy, ALL CAPS title (2-5 words). Think dramatic chess moments — like "INSANE QUEEN SACRIFICE" or "HE WALKED INTO MATE" or "THE FORK OF DOOM". Make it exciting and clickable. No quotes or punctuation.
+1. TITLE: A short, punchy, ALL CAPS title (2-6 words). Match the voice and style from the guide above. No quotes or punctuation.
 
-2. CAPTION: A quirky, funny one-liner caption that sounds casual and human (lowercase is fine). End it with #chess. Examples: "he never saw it coming #chess" or "sometimes you just gotta sac the queen #chess" or "that moment when the engine says +9 #chess"
+2. CAPTION: A quirky, funny one-liner caption matching the creator's voice. End it with #chess.
+
+Pay close attention to the "Rejected" section in the voice guide — avoid generating titles/captions similar to ones the creator has replaced before.
 
 Reply in EXACTLY this format, nothing else:
 TITLE: YOUR TITLE HERE
@@ -639,7 +783,7 @@ def _hex_to_ass(hex_color):
 
 def _make_ass_header():
     """Generate ASS header using current theme and caption Y position."""
-    theme = COLOR_THEMES.get(COLOR_THEME, COLOR_THEMES["blue"])
+    theme = COLOR_THEMES.get(CAPTION_COLOR_THEME, COLOR_THEMES["blue"])
     margin_v = int(1920 * (1 - CAPTION_Y_PERCENT / 100))
     primary = _hex_to_ass(theme["text"])    # caption text color
     outline = _hex_to_ass(theme["box"])     # caption outline = theme color
@@ -723,7 +867,7 @@ def burn_captions(video_path, ass_path, title, output_path):
     safe_ass_path = str(ass_path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
     # Theme colors
-    theme = COLOR_THEMES.get(COLOR_THEME, COLOR_THEMES["blue"])
+    theme = COLOR_THEMES.get(TITLE_COLOR_THEME, COLOR_THEMES["blue"])
     box_color = theme["box"]
     text_color = theme["text"]
     y_pct = TITLE_Y_PERCENT / 100
@@ -793,10 +937,35 @@ def burn_captions(video_path, ass_path, title, output_path):
         str(output_path),
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print("\n  ffmpeg error:")
-        print(result.stderr[-2000:])
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=False)
+    buf = b""
+    last_logged_secs = -5  # ensure first update prints
+    while True:
+        chunk = proc.stdout.read(1)
+        if not chunk:
+            break
+        if chunk in (b"\r", b"\n"):
+            line = buf.decode("utf-8", errors="replace").strip()
+            buf = b""
+            if not line:
+                continue
+            # Parse ffmpeg progress: frame= 776 fps= 47 ... time=00:00:25.47 ... speed=1.53x
+            m = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
+            if m:
+                secs = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                if secs - last_logged_secs >= 5:
+                    last_logged_secs = secs
+                    sm = re.search(r"speed=\s*([\d.]+)x", line)
+                    speed = f" ({sm.group(1)}x)" if sm else ""
+                    t_min, t_sec = divmod(int(secs), 60)
+                    print(f"  ffmpeg: {t_min}:{t_sec:02d} encoded{speed}", flush=True)
+            elif "error" in line.lower():
+                print(f"  ffmpeg: {line}", flush=True)
+        else:
+            buf += chunk
+    proc.wait()
+    if proc.returncode != 0:
+        print("\n  ffmpeg error (see terminal for details)")
         sys.exit(1)
 
     print(f"  ✓ Saved: {output_path.name}")
@@ -853,7 +1022,8 @@ def get_youtube_credentials():
 
 
 def upload_to_youtube(video_path, title, description):
-    """Upload a video to YouTube as a Short. Returns the video URL or None."""
+    """Upload a video to YouTube as a Short. Returns the video URL or None.
+    For Shorts, the description becomes YouTube's title (the burned-in title is on the video itself)."""
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload
 
@@ -865,7 +1035,7 @@ def upload_to_youtube(video_path, title, description):
 
     body = {
         "snippet": {
-            "title": title,
+            "title": description,
             "description": description,
             "tags": ["Shorts", "chess"],
             "categoryId": "20",  # Gaming
@@ -1042,8 +1212,9 @@ def get_tiktok_access_token():
     return token_data["access_token"]
 
 
-def upload_to_tiktok(video_path, title):
-    """Upload a video to TikTok via the Content Posting API. Returns publish_id or None."""
+def upload_to_tiktok(video_path, caption):
+    """Upload a video to TikTok via the Content Posting API. Returns publish_id or None.
+    caption is used as TikTok's post description (the burned-in title is on the video itself)."""
     access_token = get_tiktok_access_token()
     if not access_token:
         return None
@@ -1091,7 +1262,7 @@ def upload_to_tiktok(video_path, title):
 
     init_body = {
         "post_info": {
-            "title": title[:150],
+            "title": caption[:150],
             "privacy_level": privacy,
             "disable_comment": False,
             "disable_duet": False,
@@ -1218,7 +1389,7 @@ def preview_and_upload(output_path, title, description):
     if TIKTOK_CLIENT_KEY:
         print("\n  Upload to TikTok? (y/n)")
         if input("  > ").strip().lower() == "y":
-            publish_id = upload_to_tiktok(output_path, title)
+            publish_id = upload_to_tiktok(output_path, description)
             if publish_id:
                 print(f"\n  🎬 TikTok publish_id: {publish_id}")
             else:
@@ -1273,7 +1444,7 @@ def reprocess():
     make_ass(result, ass_path)
 
     output_name = safe_filename(title, datetime.now().strftime("%Y-%m-%d"))
-    output_path = COMPLETED_DIR / f"{output_name}.mp4"
+    output_path = unique_output_path(COMPLETED_DIR, output_name)
     burn_captions(video_path, ass_path, title, output_path)
 
     print()
@@ -1422,13 +1593,13 @@ def schedule_poster():
     plist = {
         "Label": POSTER_LAUNCHD_LABEL,
         "ProgramArguments": ["/bin/bash", "-c", post_cmd],
-        "StartInterval": 3600,  # every hour
+        "StartInterval": 900,  # every 15 minutes
         "StandardOutPath": str(OUTPUT_DIR / "poster.log"),
         "StandardErrorPath": str(OUTPUT_DIR / "poster.log"),
         "EnvironmentVariables": {
             "PATH": "/opt/homebrew/opt/ffmpeg-full/bin:/opt/homebrew/bin:/usr/bin:/bin",
         },
-        "RunAtLoad": False,
+        "RunAtLoad": True,
     }
 
     if POSTER_LAUNCHD_PLIST.exists():
@@ -1531,7 +1702,7 @@ def post_scheduled():
 
         if TIKTOK_CLIENT_KEY:
             try:
-                publish_id = upload_to_tiktok(video_path, title)
+                publish_id = upload_to_tiktok(video_path, caption)
                 if publish_id:
                     vmeta["tiktok"] = True
                     tt_ok = True
@@ -1543,6 +1714,7 @@ def post_scheduled():
         if yt_ok or tt_ok:
             vmeta["status"] = "posted"
             posted_count += 1
+            log_to_voice(vmeta.get("title"), vmeta.get("caption"))
         else:
             vmeta["status"] = "upload_failed"
 
@@ -1573,13 +1745,15 @@ def batch_process():
     import logging
 
     log_path = OUTPUT_DIR / "worker.log"
+    # Truncate log each run — GUI reads the whole file to show latest batch
+    log_path.write_text("")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
             logging.FileHandler(log_path),
-            logging.StreamHandler(sys.stdout),
         ],
+        force=True,
     )
     log = logging.getLogger("zaksclips.batch")
 
@@ -1672,7 +1846,8 @@ def batch_process():
             best = min(vods, key=lambda v: abs(
                 (datetime.fromisoformat(v["snippet"]["publishedAt"].replace("Z", "+00:00")) - clip_dt).total_seconds()))
             vod_url = f"https://www.youtube.com/watch?v={best['id']['videoId']}"
-            log.info(f"  VOD: {best['snippet']['title']}")
+            vod_title = best["snippet"]["title"]
+            log.info(f"  VOD: {vod_title}")
 
             def to_yt_ts(s):
                 s = int(s)
@@ -1680,21 +1855,30 @@ def batch_process():
                 m, sec = divmod(r, 60)
                 return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
-            stamp = datetime.now().strftime("%m-%d_%H%M")
+            stamp = datetime.now().strftime("%m-%d_%H%M%S")
             video_path = RAW_DIR / f"yt_raw_{stamp}.mp4"
             section = f"*{to_yt_ts(seg_start)}-{to_yt_ts(seg_end)}"
 
             cmd = ["yt-dlp", "--download-sections", section,
+                   "--force-keyframes-at-cuts",
+                   "--no-overwrites",
                    "--merge-output-format", "mp4", "-o", str(video_path), vod_url]
             result = subprocess.run(cmd, text=True, capture_output=True)
             if result.returncode != 0:
-                log.error(f"  yt-dlp failed: {result.stderr[:200]}")
-                continue
+                log.warning(f"  yt-dlp failed with --force-keyframes-at-cuts, retrying without...")
+                cmd = ["yt-dlp", "--download-sections", section,
+                       "--no-overwrites",
+                       "--merge-output-format", "mp4", "-o", str(video_path), vod_url]
+                result = subprocess.run(cmd, text=True, capture_output=True)
+                if result.returncode != 0:
+                    log.error(f"  yt-dlp failed: {result.stderr[:200]}")
+                    continue
 
             log.info(f"  Downloaded: {video_path.name}")
 
             # 2. Transcribe
             whisper_result = transcribe(video_path)
+            save_whisper_result(video_path, whisper_result)
 
             # 3. AI title & caption
             transcript_text = get_transcript_text(whisper_result)
@@ -1711,7 +1895,7 @@ def batch_process():
             make_ass(whisper_result, ass_path)
 
             output_name = safe_filename(title, clip["created_at"])
-            output_path = COMPLETED_DIR / f"{output_name}.mp4"
+            output_path = unique_output_path(COMPLETED_DIR, output_name)
             burn_captions(video_path, ass_path, title, output_path)
 
             ass_path.unlink(missing_ok=True)
@@ -1722,6 +1906,7 @@ def batch_process():
 
             # 5. Write metadata
             meta = load_meta()
+            vod_window = f"{fmt_time(seg_start)} – {fmt_time(seg_end)}"
             video_meta = {
                 "date": clip["created_at"][:10],
                 "mode": CLIP_MODE,
@@ -1729,7 +1914,13 @@ def batch_process():
                 "title": title,
                 "caption": caption,
                 "clip_id": clip["id"],
+                "stream_title": vod_title,
+                "vod_window": vod_window,
             }
+            if ai_title:
+                video_meta["ai_title"] = ai_title
+            if ai_caption:
+                video_meta["ai_caption"] = ai_caption
 
             if CLIP_MODE == "auto-post":
                 # Auto-upload and copy to iCloud
@@ -1750,7 +1941,7 @@ def batch_process():
                 tt_ok = False
                 if TIKTOK_CLIENT_KEY:
                     try:
-                        publish_id = upload_to_tiktok(output_path, title)
+                        publish_id = upload_to_tiktok(output_path, caption)
                         if publish_id:
                             video_meta["tiktok"] = True
                             log.info(f"  TikTok: {publish_id}")
@@ -1759,6 +1950,9 @@ def batch_process():
                         log.error(f"  TikTok upload failed: {e}")
 
                 video_meta["status"] = "posted" if (yt_ok or tt_ok) else "upload_failed"
+
+                if video_meta["status"] == "posted":
+                    log_to_voice(title, caption)
 
                 # Clean up raw file after auto-post
                 video_path.unlink(missing_ok=True)
@@ -1876,7 +2070,7 @@ def main():
 
         # 6. Burn in
         output_name = safe_filename(title, clip["created_at"])
-        output_path = COMPLETED_DIR / f"{output_name}.mp4"
+        output_path = unique_output_path(COMPLETED_DIR, output_name)
         burn_captions(video_path, ass_path, title, output_path)
 
         print()

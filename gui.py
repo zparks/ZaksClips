@@ -20,6 +20,8 @@ import numpy as np
 import sounddevice as sd
 from PIL import Image, ImageTk
 import customtkinter as ctk
+from tkinter import TclError
+from tkinter import messagebox
 
 # Import backend from clipper
 import clipper
@@ -40,25 +42,51 @@ class SkipClip(Exception):
 
 
 class LogRedirector:
-    """Redirect print() output to a GUI text widget."""
+    """Redirect ALL stdout (including subprocesses) to a GUI text widget."""
     def __init__(self, text_widget, app):
         self.text_widget = text_widget
         self.app = app
         self._real_stdout = sys.stdout
 
+        # Capture OS-level stdout so subprocess output goes to GUI too
+        self._orig_fd = os.dup(1)  # save original stdout fd
+        self._read_fd, self._write_fd = os.pipe()
+        os.dup2(self._write_fd, 1)  # redirect fd 1 to our pipe
+        os.close(self._write_fd)
+
+        # Reader thread: reads from pipe, writes to real stdout + GUI
+        def _reader():
+            with os.fdopen(self._read_fd, 'r', errors='replace') as f:
+                for line in f:
+                    # Write to real terminal
+                    os.write(self._orig_fd, line.encode())
+                    # Write to GUI
+                    stripped = line.rstrip()
+                    if stripped:
+                        self.app.after(0, self._append, stripped)
+        self._reader_thread = threading.Thread(target=_reader, daemon=True)
+        self._reader_thread.start()
+
     def write(self, msg):
         if msg.strip():
             self.app.after(0, self._append, msg)
-        self._real_stdout.write(msg)
+        # Write to real terminal fd directly (bypass the pipe to avoid duplicates)
+        try:
+            os.write(self._orig_fd, msg.encode())
+        except OSError:
+            pass
 
     def _append(self, msg):
-        self.text_widget.configure(state="normal")
-        self.text_widget.insert("end", msg.rstrip() + "\n")
-        self.text_widget.see("end")
-        self.text_widget.configure(state="disabled")
+        try:
+            self.text_widget.configure(state="normal")
+            self.text_widget.insert("end", msg.rstrip() + "\n")
+            self.text_widget.see("end")
+            self.text_widget.configure(state="disabled")
+        except TclError:
+            pass
 
     def flush(self):
-        self._real_stdout.flush()
+        pass
 
 
 class App(ctk.CTk):
@@ -75,6 +103,7 @@ class App(ctk.CTk):
         self.clips = []
         self.clip_vars = []  # BooleanVar per clip
         self._processing = False
+        self._in_review = False  # True when in review/edit flow (vs clip processing)
         self._cancelled = threading.Event()
         self._schedule_mode = clipper.CLIP_MODE  # "off", "auto", or "auto-post"
         self._active_player = None  # track video player for cleanup on step jump
@@ -82,6 +111,7 @@ class App(ctk.CTk):
         self._step_names = []      # step name strings
         self._processed_file = Path(__file__).parent / ".processed_clips.json"
         self._processed_ids = self._load_processed_ids()
+        self._known_videos = set(f.name for f in clipper.COMPLETED_DIR.glob("*.mp4"))
 
         self._build_ui()
 
@@ -92,9 +122,57 @@ class App(ctk.CTk):
         # Keyboard shortcuts
         self.bind("<Escape>", lambda e: self._on_escape())
 
+        # Enable trackpad/mousewheel scrolling on all CTkScrollableFrames
+        # Tk 9 on macOS uses <TouchpadScroll> instead of <MouseWheel>
+        self._scroll_target = None
+        self._scroll_last_widget = None
+        self._scroll_can_scroll = False
+        self.bind_all("<TouchpadScroll>", self._on_scroll, add=True)
+        self.bind_all("<MouseWheel>", self._on_scroll, add=True)
+
         # Check credentials on startup
         self.after(200, self._check_credentials)
         self.after(200, self._update_schedule_banner)
+
+        # Worker log path for batch output display
+        self._worker_log_path = clipper.OUTPUT_DIR / "worker.log"
+
+    def _on_scroll(self, event):
+        """Route scroll events to the CTkScrollableFrame under the cursor."""
+        # Only re-lookup target when the source widget changes
+        w = event.widget
+        if w is not self._scroll_last_widget:
+            self._scroll_last_widget = w
+            self._scroll_target = None
+            self._scroll_can_scroll = False
+            while w:
+                if isinstance(w, ctk.CTkScrollableFrame):
+                    self._scroll_target = w
+                    # Cache whether content is scrollable
+                    try:
+                        top, bottom = w._parent_canvas.yview()
+                        self._scroll_can_scroll = not (top <= 0.0 and bottom >= 1.0)
+                    except (AttributeError, TclError):
+                        pass
+                    break
+                try:
+                    w = w.master
+                except AttributeError:
+                    break
+        if self._scroll_target is None or not self._scroll_can_scroll:
+            return
+        # Tk 9 packs Y scroll into the low 16 bits of delta (signed)
+        raw = event.delta
+        y = (raw & 0xFFFF)
+        if y > 32767:
+            y -= 65536
+        if y == 0:
+            return
+        try:
+            step = max(-3, min(3, -y))
+            self._scroll_target._parent_canvas.yview_scroll(step, "units")
+        except (AttributeError, TclError):
+            self._scroll_target = None
 
 
     # ── Layout ──────────────────────────────────────────────────────────
@@ -127,7 +205,7 @@ class App(ctk.CTk):
         self._main_hour_menu.pack(side="left")
         ctk.CTkLabel(self._time_frame, text=":", text_color="#888",
                      font=ctk.CTkFont(size=12)).pack(side="left", padx=1)
-        _min_opts = [f"{m:02d}" for m in range(0, 60)]
+        _min_opts = [f"{m:02d}" for m in range(0, 60, 5)]
         _cur_min = f"{(clipper.SCHEDULE_MINUTE // 5) * 5:02d}"
         if _cur_min not in _min_opts:
             _cur_min = "00"
@@ -224,6 +302,7 @@ class App(ctk.CTk):
 
         # Log area (collapsible, hidden by default)
         self._log_visible = False
+        self._last_batch_errors_hash = None  # track which errors we've already toasted
         self.log_toggle = ctk.CTkButton(self, text="▶ Logs", width=70, height=24,
                                          fg_color="transparent", text_color="#888",
                                          hover_color="#333",
@@ -237,11 +316,69 @@ class App(ctk.CTk):
     def _toggle_logs(self):
         if self._log_visible:
             self.log_box.pack_forget()
-            self.log_toggle.configure(text="▶ Logs")
+            self._log_visible = False
         else:
+            self._load_worker_log()
             self.log_box.pack(fill="both", expand=True, padx=16, pady=(4, 12))
-            self.log_toggle.configure(text="▼ Logs")
-        self._log_visible = not self._log_visible
+            self._log_visible = True
+        # _load_worker_log sets the badge/color; for collapse just update the arrow
+        current = self.log_toggle.cget("text")
+        if self._log_visible:
+            self.log_toggle.configure(text=current.replace("▶", "▼"))
+        else:
+            self.log_toggle.configure(text=current.replace("▼", "▶"))
+
+    def _load_worker_log(self):
+        """Load worker.log contents into the log panel (replaces previous batch output).
+        Also checks for errors and surfaces them via toast + Logs badge."""
+        try:
+            if not self._worker_log_path.exists():
+                self._clear_log_error_badge()
+                return
+            text = self._worker_log_path.read_text().strip()
+            if not text:
+                self._clear_log_error_badge()
+                return
+            # Clear log panel and show batch output
+            self.log_box.configure(state="normal")
+            self.log_box.delete("1.0", "end")
+            error_messages = []
+            for line in text.splitlines():
+                if not line.strip():
+                    continue
+                # Strip logging timestamp: "2025-04-05 18:05:00,123 [INFO] msg" → msg
+                parts = line.split("] ", 1)
+                msg = parts[1] if len(parts) > 1 else line
+                self.log_box.insert("end", f"[batch] {msg}\n")
+                # Collect ERROR lines for toast
+                if "[ERROR]" in line:
+                    error_messages.append(msg)
+            self.log_box.see("end")
+            self.log_box.configure(state="disabled")
+
+            # Surface batch errors on the GUI
+            if error_messages:
+                errors_hash = hash(tuple(error_messages))
+                if errors_hash != self._last_batch_errors_hash:
+                    self._last_batch_errors_hash = errors_hash
+                    n = len(error_messages)
+                    self._show_toast(
+                        f"Last batch run had {n} error{'s' if n != 1 else ''} — check Logs",
+                        "#c0392b", duration=12000)
+                # Red badge on Logs toggle
+                prefix = "▼" if self._log_visible else "▶"
+                self.log_toggle.configure(
+                    text=f"{prefix} Logs  ● {len(error_messages)}",
+                    text_color="#e74c3c")
+            else:
+                self._clear_log_error_badge()
+        except Exception:
+            pass
+
+    def _clear_log_error_badge(self):
+        """Reset the Logs toggle to its normal appearance."""
+        prefix = "▼" if self._log_visible else "▶"
+        self.log_toggle.configure(text=f"{prefix} Logs", text_color="#888")
 
     # ── Overlay helpers ────────────────────────────────────────────────
 
@@ -266,7 +403,12 @@ class App(ctk.CTk):
             # If in settings (not processing), just close
             if not self._processing:
                 self._hide_overlay()
-            # If processing, treat as cancel
+            # If in review/edit flow, confirm before discarding edits
+            elif self._in_review:
+                if messagebox.askyesno("Discard Changes?",
+                                       "You have unsaved edits. Discard changes and close?"):
+                    self._cancel_processing()
+            # If processing clips, treat as cancel
             else:
                 self._cancel_processing()
 
@@ -478,8 +620,87 @@ class App(ctk.CTk):
 
     # ── Synced A/V playback ─────────────────────────────────────────
 
-    def _create_player(self, ov, video_path, max_w=640, max_h=500):
-        """Create a video player with synced audio. Returns state dict with 'stop' and 'ctrl_frame'."""
+    def _get_thumbnail(self, video_path, width=45, height=80):
+        """Extract a thumbnail from a video at ~3s. Caches to .thumb.jpg."""
+        thumb_path = Path(video_path).with_suffix(".thumb.jpg")
+        if thumb_path.exists():
+            try:
+                img = Image.open(thumb_path)
+                return ctk.CTkImage(light_image=img, dark_image=img, size=(width, height))
+            except Exception:
+                pass
+        # Generate thumbnail
+        try:
+            container = av.open(str(video_path))
+            vst = container.streams.video[0]
+            # Seek to ~3 seconds
+            target = int(3 * av.time_base)
+            container.seek(target)
+            for frame in container.decode(video=0):
+                img = frame.to_image()
+                img = img.resize((width, height), Image.LANCZOS)
+                img.save(str(thumb_path), "JPEG", quality=70)
+                container.close()
+                return ctk.CTkImage(light_image=img, dark_image=img, size=(width, height))
+            container.close()
+        except Exception:
+            pass
+        return None
+
+    def _draw_title_overlay(self, img, title_text, theme_key, y_pct):
+        """Draw a title overlay on a PIL image, matching the burned style."""
+        from PIL import ImageDraw, ImageFont
+        if not title_text.strip():
+            return img
+        theme = clipper.COLOR_THEMES.get(theme_key, clipper.COLOR_THEMES["blue"])
+        box_color = theme["box"]
+        text_color = theme["text"]
+
+        img = img.copy()
+        draw = ImageDraw.Draw(img)
+        w, h = img.size
+
+        # Scale font size relative to display size (72pt at 1080w)
+        fontsize = max(12, int(w * 72 / 1080))
+        pad = max(4, int(fontsize * 0.28))
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", fontsize)
+        except Exception:
+            font = ImageFont.load_default()
+
+        # Wrap title like ffmpeg does (~14 chars per line)
+        words = title_text.upper().split()
+        lines = []
+        cur = ""
+        for word in words:
+            if cur and len(cur) + 1 + len(word) > 14:
+                lines.append(cur)
+                cur = word
+            else:
+                cur = f"{cur} {word}" if cur else word
+        if cur:
+            lines.append(cur)
+
+        line_h = fontsize + 2 * pad
+        total_h = len(lines) * line_h
+        base_y = int(h * y_pct / 100) - total_h // 2
+
+        for i, line in enumerate(lines):
+            bbox = draw.textbbox((0, 0), line, font=font)
+            tw = bbox[2] - bbox[0]
+            tx = (w - tw) // 2
+            ty = base_y + i * line_h
+            # Draw box
+            draw.rectangle([tx - pad, ty - pad, tx + tw + pad, ty + fontsize + pad],
+                           fill=box_color)
+            # Draw text
+            draw.text((tx, ty), line, fill=text_color, font=font)
+
+        return img
+
+    def _create_player(self, ov, video_path, max_w=640, max_h=500, title_overlay_fn=None):
+        """Create a video player with synced audio. Returns state dict with 'stop' and 'ctrl_frame'.
+        title_overlay_fn: optional callable() → (title_text, theme_key, y_pct) for live title preview."""
         # Release MLX/Metal GPU resources before opening video to avoid trace trap crashes
         import gc
         gc.collect()
@@ -551,12 +772,14 @@ class App(ctk.CTk):
         def _stop():
             state["stopped"] = True
             state["playing"] = False
-            # Wait for the playback thread to fully exit before destroying widgets
-            playback_done.wait(timeout=2.0)
+            # Stop audio immediately — don't wait for playback thread
             s = sd_stream[0]
             if s:
-                try: s.stop(); s.close()
+                try: s.abort(); s.close()
                 except Exception: pass
+                sd_stream[0] = None
+            # Wait for the playback thread to fully exit before destroying widgets
+            playback_done.wait(timeout=2.0)
         state["stop"] = _stop
 
         def _playback(start_offset=0.0):
@@ -602,6 +825,7 @@ class App(ctk.CTk):
                 container.seek(int(start_offset * av.time_base))
 
             wall_start = time.monotonic()
+            audio_start_time = [None]  # sounddevice hardware time when audio started
             pts_start = None
 
             for packet in container.demux():
@@ -612,6 +836,7 @@ class App(ctk.CTk):
                     container.seek(int(target * av.time_base))
                     pts_start = None
                     wall_start = time.monotonic()
+                    audio_start_time[0] = None
                     if audio_q:
                         while not audio_q.empty():
                             try: audio_q.get_nowait()
@@ -628,6 +853,9 @@ class App(ctk.CTk):
                     time.sleep(0.05)
                 if pt is not None:
                     wall_start += time.monotonic() - pt
+                    # Reset audio clock reference after pause
+                    if astream and audio_start_time[0] is not None:
+                        audio_start_time[0] = astream.time - (time.monotonic() - wall_start)
                 if state["stopped"]: break
                 if state["seek_to"] is not None: continue
 
@@ -637,12 +865,26 @@ class App(ctk.CTk):
                         ft = float(frame.pts * vst.time_base) if frame.pts else 0.0
                         state["current_time"] = ft
                         if pts_start is None: pts_start = ft
-                        delay = (ft - pts_start) - (time.monotonic() - wall_start)
+
+                        # Sync to audio hardware clock when available
+                        if astream and audio_start_time[0] is not None:
+                            elapsed = astream.time - audio_start_time[0]
+                            delay = (ft - pts_start) - elapsed
+                        else:
+                            delay = (ft - pts_start) - (time.monotonic() - wall_start)
                         if delay > 0.005: time.sleep(delay)
                         elif delay < -0.1: continue
                         img = frame.to_image()
                         if scale != 1.0:
                             img = img.resize((dw, dh), Image.LANCZOS)
+                        # Live title overlay (first 5 seconds)
+                        if title_overlay_fn and ft <= 5.0:
+                            try:
+                                overlay_info = title_overlay_fn()
+                                if overlay_info:
+                                    img = self._draw_title_overlay(img, *overlay_info)
+                            except Exception:
+                                pass
                         def _disp(img=img, ft=ft):
                             if state["stopped"]: return
                             try:
@@ -656,6 +898,9 @@ class App(ctk.CTk):
                         self.after(0, _disp)
                     elif isinstance(frame, av.AudioFrame):
                         if audio_q and state["playing"]:
+                            # Record audio start time on first chunk
+                            if audio_start_time[0] is None and astream:
+                                audio_start_time[0] = astream.time
                             try:
                                 for rf in resampler.resample(frame):
                                     arr = rf.to_ndarray()
@@ -881,6 +1126,11 @@ class App(ctk.CTk):
         skipped_note = f" ({skipped} skipped — no VOD)" if skipped else ""
         self._set_status(f"{len(self.clips)} clips{skipped_note} — select and press Process")
 
+        # Show action buttons now that clips are loaded
+        self.auto_process_btn.pack(side="left")
+        self.process_btn.pack(side="left", padx=(8, 0))
+        self.select_all_clips_btn.pack(side="left", padx=(8, 0))
+
     def _select_all_clips(self):
         all_selected = all(v.get() for v in self.clip_vars) if self.clip_vars else False
         if all_selected:
@@ -893,7 +1143,10 @@ class App(ctk.CTk):
         self.select_all_clips_btn.configure(text="Deselect All")
 
     def _set_status(self, text):
-        self.status_label.configure(text=text)
+        try:
+            self.status_label.configure(text=text)
+        except TclError:
+            pass
 
     def _show_progress(self):
         """Show the progress bar."""
@@ -995,9 +1248,8 @@ class App(ctk.CTk):
                     elif "[Merger]" in line or "[Merging]" in line or "Merging" in line:
                         app.after(0, app._update_working,
                                   "Merging Streams", None, "Almost done...", 0.95)
-                    elif "[download]" not in line:
-                        # Only log non-download lines (skip all yt-dlp progress spam)
-                        print(line)
+                    # Log all yt-dlp output to the log panel
+                    print(line, flush=True)
                 else:
                     buf += chunk
             proc.wait()
@@ -1132,6 +1384,7 @@ class App(ctk.CTk):
                 self.after(0, self._update_step, 2)
                 self.after(0, self._show_working, "Transcribing Audio", sub)
                 result = clipper.transcribe(video_path)
+                clipper.save_whisper_result(video_path, result)
 
                 ai_title, ai_caption = None, None
                 if clipper.ANTHROPIC_API_KEY:
@@ -1170,7 +1423,7 @@ class App(ctk.CTk):
                     self.after(0, self._update_working, "Burning Captions", sub,
                                "This may take a minute...")
                     output_name = clipper.safe_filename(title, clip["created_at"])
-                    output_path = clipper.COMPLETED_DIR / f"{output_name}.mp4"
+                    output_path = clipper.unique_output_path(clipper.COMPLETED_DIR, output_name)
                     clipper.burn_captions(video_path, ass_path, title, output_path)
 
                     self.after(0, self._hide_working)
@@ -1198,12 +1451,23 @@ class App(ctk.CTk):
                     elif choice == "draft":
                         # Save as draft — keeps video in My Videos at "Processed" stage
                         self._mark_processed(clip["id"])
-                        self._set_video_status(output_path.name,
-                                               status="ready_for_review",
-                                               date=clip["created_at"][:10],
-                                               title=title, caption=description,
-                                               raw_path=str(video_path),
-                                               clip_id=clip["id"])
+                        vod_window = f"{clipper.fmt_time(seg_start)} – {clipper.fmt_time(seg_end)}"
+                        draft_kwargs = dict(
+                            status="ready_for_review", reviewed=True,
+                            date=clip["created_at"][:10],
+                            title=title, caption=description,
+                            raw_path=str(video_path),
+                            clip_id=clip["id"],
+                            vod_window=vod_window,
+                            stream_title=clip["title"])
+                        if ai_title:
+                            draft_kwargs["ai_title"] = ai_title
+                        if ai_caption:
+                            draft_kwargs["ai_caption"] = ai_caption
+                        self._set_video_status(output_path.name, **draft_kwargs)
+                        # Log rejection if user changed AI suggestion
+                        if ai_title or ai_caption:
+                            clipper.log_rejection_to_voice(ai_title, title, ai_caption, description)
                         print(f"  Saved as draft: {output_path.name}")
                         break  # exit while loop without uploading
                     elif choice == "skip":
@@ -1235,14 +1499,22 @@ class App(ctk.CTk):
                                 self.after(0, self._hide_working)
                             seg_start, seg_end = new_start, new_end
 
-                        # Re-transcribe with new trim
+                        # Re-transcribe or trim existing result
                         self._set_current_step(2)
                         self.after(0, self._update_step, 2)
-                        self.after(0, self._show_working, "Transcribing Audio", sub)
-                        result = clipper.transcribe(video_path)
+                        if needs_redownload:
+                            # Extended — must re-transcribe
+                            self.after(0, self._show_working, "Transcribing Audio", sub)
+                            result = clipper.transcribe(video_path)
+                            clipper.save_whisper_result(video_path, result)
+                        else:
+                            # Pure trim — adjust timestamps from existing result
+                            orig_duration = seg_end - seg_start + trim_s + trim_e
+                            result = clipper.trim_whisper_result(result, trim_s, trim_e, orig_duration)
+                            clipper.save_whisper_result(video_path, result)
 
                         if clipper.ANTHROPIC_API_KEY:
-                            self.after(0, self._update_working, "Generating Title & Caption", sub)
+                            self.after(0, self._show_working, "Generating Title & Caption", sub)
                             transcript_text = clipper.get_transcript_text(result)
                             ai_title, ai_caption = clipper.generate_title_caption(
                                 transcript_text, clip["title"])
@@ -1257,10 +1529,21 @@ class App(ctk.CTk):
 
                 # Approved — upload flow
                 self._mark_processed(clip["id"])
-                self._set_video_status(output_path.name,
-                                       status="approved",
-                                       date=clip["created_at"][:10],
-                                       clip_id=clip["id"])
+                vod_window = f"{clipper.fmt_time(seg_start)} – {clipper.fmt_time(seg_end)}"
+                approved_kwargs = dict(
+                    status="approved",
+                    date=clip["created_at"][:10],
+                    clip_id=clip["id"],
+                    vod_window=vod_window,
+                    stream_title=clip["title"])
+                if ai_title:
+                    approved_kwargs["ai_title"] = ai_title
+                if ai_caption:
+                    approved_kwargs["ai_caption"] = ai_caption
+                self._set_video_status(output_path.name, **approved_kwargs)
+                # Log rejection if user changed AI suggestion
+                if ai_title or ai_caption:
+                    clipper.log_rejection_to_voice(ai_title, title, ai_caption, description)
                 self._set_current_step(6)
                 self.after(0, self._update_step, 6)
                 self.after(0, self._show_working, "Copying to iCloud", sub)
@@ -1289,7 +1572,7 @@ class App(ctk.CTk):
                     do_tt = self._confirm_dialog("TikTok", "Upload to TikTok?")
                     if do_tt:
                         self.after(0, self._show_working, "Uploading to TikTok", sub)
-                        publish_id = clipper.upload_to_tiktok(output_path, title)
+                        publish_id = clipper.upload_to_tiktok(output_path, description)
                         self.after(0, self._hide_working)
                         if publish_id:
                             self._set_video_status(output_path.name, tiktok=True)
@@ -1305,6 +1588,7 @@ class App(ctk.CTk):
                 vmeta = self._get_video_status(output_path.name)
                 if vmeta.get("youtube") or vmeta.get("tiktok"):
                     self._set_video_status(output_path.name, status="posted")
+                    clipper.log_to_voice(title, description)
                 elif yt_failed or tt_failed:
                     self._set_video_status(output_path.name, status="upload_failed")
                 elif not do_yt and not do_tt:
@@ -1336,6 +1620,139 @@ class App(ctk.CTk):
                 self._show_toast("Processing cancelled", "#c0392b", duration=3000)
                 self._cancelled.clear()
             # Return to My Videos
+            self._hide_overlay()
+            self._refresh_output_tab()
+
+        self._run_in_thread(_run, on_done=_cleanup)
+
+    def _auto_process_selected(self):
+        """Auto-process selected clips — download, transcribe, AI title, burn.
+        No interactive steps. Results queued for review in My Videos."""
+        if self._processing:
+            return
+
+        selected = [self.clips[i] for i, v in enumerate(self.clip_vars) if v.get()]
+        if not selected:
+            self._set_status("No clips selected")
+            return
+
+        self._processing = True
+        self._cancelled.clear()
+        try:
+            self.process_btn.configure(state="disabled")
+            self.auto_process_btn.configure(state="disabled")
+            self.fetch_btn.configure(state="disabled")
+        except (AttributeError, Exception):
+            pass
+        self.cancel_btn.pack(side="right", padx=(8, 0))
+
+        def _run():
+            total = len(selected)
+            if clipper.PLATFORM != "youtube":
+                print("  Auto-process requires VOD Platform = youtube")
+                return
+
+            try:
+                channel_id = clipper.get_youtube_channel_id()
+            except SystemExit:
+                print("  YouTube channel not found — check YOUTUBE_CHANNEL_HANDLE")
+                return
+
+            for idx, clip in enumerate(selected):
+                if self._cancelled.is_set():
+                    print("\n  Cancelled by user")
+                    break
+
+                self.after(0, self._show_working,
+                           f"Auto Processing ({idx+1}/{total})",
+                           clip.get("title", "")[:40])
+                print(f"\n  [{idx+1}/{total}] {clip['title']}")
+
+                try:
+                    vod_end = clip["vod_offset"] + clip["duration"]
+                    seg_start = max(0, vod_end - int(clipper.CLIP_LENGTH * 60))
+                    seg_end = vod_end
+
+                    # 1. Find VOD
+                    vods = clipper.find_youtube_vod(channel_id, clip["created_at"])
+                    if not vods:
+                        print(f"  No YouTube VOD found — skipping")
+                        continue
+
+                    clip_dt = datetime.fromisoformat(clip["created_at"].replace("Z", "+00:00"))
+                    best = min(vods, key=lambda v: abs(
+                        (datetime.fromisoformat(v["snippet"]["publishedAt"].replace("Z", "+00:00")) - clip_dt).total_seconds()))
+                    vod_url = f"https://www.youtube.com/watch?v={best['id']['videoId']}"
+                    vod_title = best["snippet"]["title"]
+                    print(f"  VOD: {vod_title}")
+
+                    # 2. Download
+                    self.after(0, self._update_working, f"Downloading ({idx+1}/{total})",
+                               clip.get("title", "")[:40])
+                    video_path = clipper.download_from_youtube(seg_start, seg_end, clip)
+
+                    # 3. Transcribe
+                    self.after(0, self._update_working, f"Transcribing ({idx+1}/{total})",
+                               clip.get("title", "")[:40])
+                    whisper_result = clipper.transcribe(video_path)
+                    clipper.save_whisper_result(video_path, whisper_result)
+
+                    # 4. AI title & caption
+                    transcript_text = clipper.get_transcript_text(whisper_result)
+                    ai_title, ai_caption = None, None
+                    if clipper.ANTHROPIC_API_KEY:
+                        ai_title, ai_caption = clipper.generate_title_caption(
+                            transcript_text, clip["title"])
+
+                    title = ai_title or clip["title"]
+                    caption = ai_caption or title
+
+                    # 5. Burn captions
+                    self.after(0, self._update_working, f"Burning Captions ({idx+1}/{total})",
+                               title[:40])
+                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    ass_path = clipper.RAW_DIR / f"{stamp}.ass"
+                    clipper.make_ass(whisper_result, ass_path)
+
+                    output_name = clipper.safe_filename(title, clip["created_at"])
+                    output_path = clipper.unique_output_path(clipper.COMPLETED_DIR, output_name)
+                    clipper.burn_captions(video_path, ass_path, title, output_path)
+                    ass_path.unlink(missing_ok=True)
+
+                    # 6. Save metadata
+                    self._mark_processed(clip["id"])
+                    vod_window = f"{clipper.fmt_time(seg_start)} – {clipper.fmt_time(seg_end)}"
+                    meta_kwargs = dict(
+                        status="ready_for_review",
+                        date=clip["created_at"][:10],
+                        mode="auto",
+                        raw_path=str(video_path),
+                        title=title, caption=caption,
+                        clip_id=clip["id"],
+                        stream_title=vod_title,
+                        vod_window=vod_window)
+                    if ai_title:
+                        meta_kwargs["ai_title"] = ai_title
+                    if ai_caption:
+                        meta_kwargs["ai_caption"] = ai_caption
+                    self._set_video_status(output_path.name, **meta_kwargs)
+
+                    print(f"  ✓ Ready for review: {output_path.name}")
+
+                except Exception as e:
+                    print(f"  Error: {e}")
+                    continue
+
+            self.after(0, self._hide_working)
+            print(f"\n  Auto-processed {total} clip(s)")
+
+        def _cleanup():
+            self._processing = False
+            self._hide_working()
+            self.cancel_btn.pack_forget()
+            if self._cancelled.is_set():
+                self._show_toast("Processing cancelled", "#c0392b", duration=3000)
+                self._cancelled.clear()
             self._hide_overlay()
             self._refresh_output_tab()
 
@@ -1390,33 +1807,19 @@ class App(ctk.CTk):
         btn_frame = ctk.CTkFrame(ov, fg_color="transparent")
         btn_frame.pack(fill="x", padx=16, pady=(8, 0))
 
-        self.process_btn = ctk.CTkButton(btn_frame, text="Process Selected", width=150,
-                                          fg_color="#1D8CD7", command=self._process_selected)
-        self.process_btn.pack(side="left")
+        self.auto_process_btn = ctk.CTkButton(btn_frame, text="Auto Process", width=130,
+                                               fg_color="#2d8a4e", hover_color="#25713f",
+                                               command=self._auto_process_selected)
+
+        self.process_btn = ctk.CTkButton(btn_frame, text="Manually Process", width=150,
+                                          fg_color="#1D8CD7",
+                                          command=self._process_selected)
 
         self.select_all_clips_btn = ctk.CTkButton(btn_frame, text="Select All", width=90,
                                                     fg_color="#555", command=self._select_all_clips)
-        self.select_all_clips_btn.pack(side="left", padx=(8, 0))
 
         ctk.CTkButton(btn_frame, text="Back", width=80, fg_color="#555",
                        command=self._close_fetch_flow).pack(side="right")
-
-    def _run_batch_now(self):
-        """Run batch processing immediately (same as what the scheduler does)."""
-        if self._processing:
-            return
-        self._processing = True
-
-        def _run():
-            self.after(0, self._show_working, "Processing Clips", "Running batch...")
-            clipper.batch_process()
-            self.after(0, self._hide_working)
-
-        def _done():
-            self._processing = False
-            self._refresh_output_tab()
-
-        self._run_in_thread(_run, on_done=_done)
 
     def _close_fetch_flow(self):
         """Close the fetch overlay and return to My Videos."""
@@ -1441,13 +1844,24 @@ class App(ctk.CTk):
         self.output_scroll = ctk.CTkScrollableFrame(tab)
         self.output_scroll.pack(fill="both", expand=True)
 
-        self.output_files = []
-        self.output_vars = []
+        self.output_items = []  # list of (BooleanVar, Path) tuples
 
         self._refresh_output_tab()
 
     def _refresh_output_tab(self):
         """Reload the output file list, grouped by date with status badges."""
+        self._load_worker_log()
+
+        # Detect new videos since last refresh
+        current_videos = set(f.name for f in clipper.COMPLETED_DIR.glob("*.mp4"))
+        new_videos = current_videos - self._known_videos
+        if new_videos:
+            count = len(new_videos)
+            self._show_toast(
+                f"{count} new clip{'s' if count > 1 else ''} ready for review",
+                "#2d8a4e", duration=5000)
+        self._known_videos = current_videos
+
         for w in self.output_scroll.winfo_children():
             w.destroy()
 
@@ -1458,59 +1872,38 @@ class App(ctk.CTk):
 
         is_scheduled = self._schedule_mode in ("auto", "auto-post")
 
-        if is_scheduled:
-            ctk.CTkButton(self._output_hdr, text="Get Clips Manually", width=140,
-                           fg_color="#555", height=28, font=ctk.CTkFont(size=12),
-                           command=self._open_fetch_flow).pack(side="right")
-        else:
-            ctk.CTkButton(self._output_hdr, text="Get Clips", width=100,
-                           fg_color="#1D8CD7", height=28,
-                           font=ctk.CTkFont(size=12, weight="bold"),
-                           command=self._open_fetch_flow).pack(side="right")
+        ctk.CTkButton(self._output_hdr, text="Get Clips", width=100,
+                       fg_color="#1D8CD7", height=28,
+                       font=ctk.CTkFont(size=12, weight="bold"),
+                       command=self._open_fetch_flow).pack(side="right")
 
         ctk.CTkButton(self._output_hdr, text="Refresh", width=70, fg_color="#555", height=28,
                        command=self._refresh_output_tab).pack(side="right", padx=(0, 6))
-        self.delete_btn = ctk.CTkButton(self._output_hdr, text="Delete Selected", width=120,
-                                         fg_color="#c0392b", height=28,
-                                         command=self._delete_selected_outputs)
-        self.delete_btn.pack(side="right", padx=(0, 6))
-        self.select_all_btn = ctk.CTkButton(self._output_hdr, text="Select All", width=80,
-                                              fg_color="#555", height=28,
-                                              command=self._select_all_outputs)
-        self.select_all_btn.pack(side="right", padx=(0, 6))
 
         files = sorted(
             [f for f in clipper.COMPLETED_DIR.glob("*.mp4")],
             key=lambda f: f.stat().st_mtime, reverse=True,
         )
 
-        self.output_files = files
-        self.output_vars = []
+        self.output_items = []
 
         if not files:
             self.output_summary.configure(text="")
             empty = ctk.CTkFrame(self.output_scroll, fg_color="transparent")
             empty.pack(expand=True, pady=40)
 
+            ctk.CTkLabel(empty, text="No videos yet",
+                         font=ctk.CTkFont(size=16, weight="bold"),
+                         text_color="#666").pack()
+            ctk.CTkButton(empty, text="Get Clips", width=140, height=36,
+                           fg_color="#1D8CD7",
+                           font=ctk.CTkFont(size=14, weight="bold"),
+                           command=self._open_fetch_flow).pack(pady=(12, 0))
             if is_scheduled:
                 hour_label = f"{clipper.SCHEDULE_HOUR % 12 or 12}:{clipper.SCHEDULE_MINUTE:02d}{'am' if clipper.SCHEDULE_HOUR < 12 else 'pm'}"
-                ctk.CTkLabel(empty, text="No videos yet",
-                             font=ctk.CTkFont(size=16, weight="bold"),
-                             text_color="#666").pack()
-                ctk.CTkLabel(empty, text=f"Your clips will be processed daily at {hour_label}.\n"
-                             "They'll appear here ready for review.",
-                             text_color="#555", justify="center").pack(pady=(4, 0))
-                ctk.CTkButton(empty, text="Process Now", width=120,
-                               fg_color="#555", height=30,
-                               command=self._run_batch_now).pack(pady=(12, 0))
+                ctk.CTkLabel(empty, text=f"or wait for your next scheduled run at {hour_label}",
+                             text_color="#555", font=ctk.CTkFont(size=11)).pack(pady=(6, 0))
             else:
-                ctk.CTkLabel(empty, text="No videos yet",
-                             font=ctk.CTkFont(size=16, weight="bold"),
-                             text_color="#666").pack()
-                ctk.CTkButton(empty, text="Get Clips", width=140, height=36,
-                               fg_color="#1D8CD7",
-                               font=ctk.CTkFont(size=14, weight="bold"),
-                               command=self._open_fetch_flow).pack(pady=(12, 0))
                 ctk.CTkLabel(empty, text="Fetch your recent Twitch clips and process them into videos",
                              text_color="#555", font=ctk.CTkFont(size=11),
                              justify="center").pack(pady=(6, 0))
@@ -1519,29 +1912,48 @@ class App(ctk.CTk):
         total_mb = sum(f.stat().st_size for f in files) / 1_000_000
         self.output_summary.configure(text=f"{len(files)} video{'s' if len(files) != 1 else ''}  ·  {total_mb:.1f} MB")
 
-        # Split files into three groups
-        active_files = []   # drafts, approved, failed — need attention
+        # Add Select All / Delete Selected only when there are files
+        self.select_all_btn = ctk.CTkButton(self._output_hdr, text="Select All", width=80,
+                                              fg_color="#555", height=28,
+                                              command=self._select_all_outputs)
+        self.select_all_btn.pack(side="right", padx=(0, 6))
+        self.delete_btn = ctk.CTkButton(self._output_hdr, text="Delete Selected", width=120,
+                                         fg_color="#c0392b", height=28,
+                                         command=self._delete_selected_outputs)
+        self.delete_btn.pack(side="right", padx=(0, 6))
+
+        # Split files into four groups
+        active_files = []   # ready_for_review, approved, failed — need attention
+        draft_files = []    # "maybe later" — out of the way but not deleted
         scheduled_files = []
         posted_files = []
 
+        incomplete_files = []
+
         for f in files:
-            status = self._get_video_status(f.name).get("status", "")
-            if status == "posted":
+            vmeta = self._get_video_status(f.name)
+            status = vmeta.get("status", "")
+            if not vmeta or not status:
+                incomplete_files.append(f)
+            elif status == "posted":
                 posted_files.append(f)
             elif status == "scheduled":
                 scheduled_files.append(f)
+            elif status == "draft":
+                draft_files.append(f)
             else:
                 active_files.append(f)
 
         # Sort each group by mtime (newest first)
         active_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        draft_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
         scheduled_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
         posted_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
 
         def _render_video_card(parent, f):
             """Render a single video card into the parent frame."""
             var = ctk.BooleanVar(value=False)
-            self.output_vars.append(var)
+            self.output_items.append((var, f))
 
             vmeta = self._get_video_status(f.name)
             status = vmeta.get("status", "")
@@ -1560,6 +1972,13 @@ class App(ctk.CTk):
             ctk.CTkCheckBox(row, text="", variable=var, width=24).pack(
                 side="left", padx=(8, 0))
 
+            # Thumbnail
+            thumb = self._get_thumbnail(f)
+            if thumb:
+                thumb_label = ctk.CTkLabel(row, text="", image=thumb, width=45, height=80)
+                thumb_label._thumb_ref = thumb  # prevent GC
+                thumb_label.pack(side="left", padx=(6, 0))
+
             info = ctk.CTkFrame(row, fg_color="transparent")
             info.pack(side="left", fill="x", expand=True, padx=(6, 0), pady=4)
 
@@ -1569,9 +1988,16 @@ class App(ctk.CTk):
 
             size_mb = f.stat().st_size / 1_000_000
             mtime = datetime.fromtimestamp(f.stat().st_mtime)
-            meta_text = f"{mtime.strftime('%I:%M %p')}  ·  {size_mb:.1f} MB"
+            meta_parts = [mtime.strftime('%I:%M %p'), f"{size_mb:.1f} MB"]
             if vmeta.get("mode") in ("auto", "auto-post"):
-                meta_text += "  ·  auto"
+                meta_parts.append("auto")
+            stream = vmeta.get("stream_title")
+            vod_win = vmeta.get("vod_window")
+            if stream:
+                meta_parts.append(stream)
+            if vod_win:
+                meta_parts.append(f"VOD {vod_win}")
+            meta_text = "  ·  ".join(meta_parts)
             ctk.CTkLabel(info, text=meta_text, anchor="w",
                          text_color="#666", font=ctk.CTkFont(size=11)).pack(anchor="w")
 
@@ -1596,25 +2022,44 @@ class App(ctk.CTk):
             _dot(prog, True).pack(side="left")
             ctk.CTkLabel(prog, text="Processed", text_color="#4CAF50",
                          font=ctk.CTkFont(size=10)).pack(side="left", padx=(1, 0))
-            _line(prog).pack(side="left")
 
+            is_seen = vmeta.get("reviewed", False)
             approved_done = is_approved or is_scheduled_v or is_posted or is_failed
-            dot_color = "#4CAF50" if approved_done else "#e67e22"
-            _dot(prog, approved_done, color=dot_color).pack(side="left")
-            ctk.CTkLabel(prog, text="Approved",
-                         text_color=dot_color if approved_done else "#555",
-                         font=ctk.CTkFont(size=10)).pack(side="left", padx=(1, 0))
-            _line(prog).pack(side="left")
 
+            # ● Seen
+            _line(prog).pack(side="left")
+            seen_done = is_seen or approved_done
+            # In auto-post mode, posted without being seen = red warning
+            unseen_posted = is_posted and not is_seen
+            if unseen_posted:
+                seen_color = "#c0392b"
+                seen_text = "Unseen"
+                _dot(prog, True, fail=True).pack(side="left")
+            else:
+                seen_color = "#4CAF50" if seen_done else "#555"
+                seen_text = "Seen"
+                _dot(prog, seen_done, color=seen_color).pack(side="left")
+            ctk.CTkLabel(prog, text=seen_text, text_color=seen_color,
+                         font=ctk.CTkFont(size=10)).pack(side="left", padx=(1, 0))
+
+            # ● Approved
+            _line(prog).pack(side="left")
+            approved_color = "#4CAF50" if approved_done else "#555"
+            _dot(prog, approved_done, color=approved_color).pack(side="left")
+            ctk.CTkLabel(prog, text="Approved", text_color=approved_color,
+                         font=ctk.CTkFont(size=10)).pack(side="left", padx=(1, 0))
+
+            # ● Posted
+            _line(prog).pack(side="left")
             if is_posted and has_yt and has_tt:
                 _dot(prog, True).pack(side="left")
                 ctk.CTkLabel(prog, text="Posted (YT + TT)", text_color="#4CAF50",
                              font=ctk.CTkFont(size=10)).pack(side="left", padx=(1, 0))
             elif is_posted:
-                _dot(prog, True).pack(side="left")
                 parts = []
                 if has_yt: parts.append("YT")
                 if has_tt: parts.append("TT")
+                _dot(prog, True).pack(side="left")
                 ctk.CTkLabel(prog, text=f"Posted ({' + '.join(parts)})", text_color="#4CAF50",
                              font=ctk.CTkFont(size=10)).pack(side="left", padx=(1, 0))
             elif is_scheduled_v:
@@ -1662,6 +2107,9 @@ class App(ctk.CTk):
                 if approved_done:
                     btn_color = "#555"
                     btn_text = "Edit"
+                elif is_seen:
+                    btn_color = "#1D8CD7"
+                    btn_text = "Continue"
                 else:
                     btn_color = "#e67e22"
                     btn_text = "Review"
@@ -1672,17 +2120,118 @@ class App(ctk.CTk):
                               command=lambda path=f: self._review_video(path)).pack(
                     side="right", padx=(0, 8), pady=4)
 
+            # "Retry" button for failed uploads
+            if is_failed:
+                ctk.CTkButton(row, text="Retry", width=65, height=30,
+                              fg_color="#e67e22", hover_color="#d35400",
+                              font=ctk.CTkFont(size=12),
+                              command=lambda path=f: self._review_video(path)).pack(
+                    side="right", padx=(0, 4), pady=4)
+
+            # "Mark Posted" for videos missing a platform or with failures
+            missing_yt = not has_yt
+            missing_tt = not has_tt
+            show_mark = (is_posted and (missing_yt or missing_tt)) or is_failed or (is_approved and not is_scheduled_v)
+            if show_mark:
+                def _mark_posted(fp=f, m_yt=missing_yt, m_tt=missing_tt):
+                    self._mark_posted_dialog(fp, m_yt, m_tt)
+                ctk.CTkButton(row, text="Mark Posted", width=90, height=28,
+                              fg_color="#333", hover_color="#444",
+                              text_color="#aaa", font=ctk.CTkFont(size=11),
+                              command=_mark_posted).pack(
+                    side="right", padx=(0, 4), pady=4)
+
             ctk.CTkButton(row, text="\u25B6", width=32, height=32,
                           fg_color="#333", hover_color="#444",
                           font=ctk.CTkFont(size=14),
                           command=lambda path=f: subprocess.run(
                               ["open", str(path)])).pack(
-                side="right", padx=(8, 0), pady=4)
+                side="right", padx=(8, 8), pady=4)
 
-        # ── Active videos (drafts, approved, failed) ──
+            # "Draft" / "Undraft" toggle — shelve videos for later
+            is_draft = status == "draft"
+            if not is_posted and not is_scheduled_v:
+                if is_draft:
+                    def _undraft(fp=f):
+                        self._set_video_status(fp.name, status="ready_for_review")
+                        self._refresh_output_tab()
+                    ctk.CTkButton(row, text="Undraft", width=70, height=28,
+                                  fg_color="#555", hover_color="#666",
+                                  text_color="#ccc", font=ctk.CTkFont(size=11),
+                                  command=_undraft).pack(
+                        side="right", padx=(0, 4), pady=4)
+                else:
+                    def _draft(fp=f):
+                        self._set_video_status(fp.name, status="draft")
+                        self._refresh_output_tab()
+                    ctk.CTkButton(row, text="Draft", width=55, height=28,
+                                  fg_color="#333", hover_color="#444",
+                                  text_color="#888", font=ctk.CTkFont(size=11),
+                                  command=_draft).pack(
+                        side="right", padx=(0, 4), pady=4)
+
+        # ── Incomplete videos (no meta — processing was interrupted) ──
+        if incomplete_files:
+            inc_container = ctk.CTkFrame(self.output_scroll, fg_color="transparent")
+            inc_container.pack(fill="x", pady=(0, 4))
+
+            ctk.CTkLabel(inc_container,
+                         text=f"Incomplete ({len(incomplete_files)})",
+                         text_color="#e67e22", anchor="w",
+                         font=ctk.CTkFont(size=13, weight="bold")).pack(fill="x", padx=4)
+
+            for f in incomplete_files:
+                row = ctk.CTkFrame(inc_container, fg_color="#1a1a1a", corner_radius=6)
+                row.pack(fill="x", pady=2)
+
+                var = ctk.BooleanVar(value=False)
+                self.output_items.append((var, f))
+
+                ctk.CTkCheckBox(row, text="", variable=var, width=24).pack(
+                    side="left", padx=(8, 0))
+
+                info = ctk.CTkFrame(row, fg_color="transparent")
+                info.pack(side="left", fill="x", expand=True, padx=(6, 0), pady=4)
+
+                ctk.CTkLabel(info, text=f.stem, anchor="w",
+                             font=ctk.CTkFont(size=13)).pack(anchor="w")
+
+                size_mb = f.stat().st_size / 1_000_000
+                ctk.CTkLabel(info, text=f"{size_mb:.1f} MB  ·  Processing was interrupted",
+                             anchor="w", text_color="#e67e22",
+                             font=ctk.CTkFont(size=11)).pack(anchor="w")
+
+        # ── Active videos (ready_for_review, approved, failed) ──
         if active_files:
             for f in active_files:
                 _render_video_card(self.output_scroll, f)
+
+        # ── Drafts section (collapsed by default) ──
+        if draft_files:
+            draft_container = ctk.CTkFrame(self.output_scroll, fg_color="transparent")
+            draft_container.pack(fill="x", pady=(8, 0))
+
+            draft_inner = ctk.CTkFrame(self.output_scroll, fg_color="transparent")
+
+            def _toggle_drafts():
+                if draft_inner.winfo_ismapped():
+                    draft_inner.pack_forget()
+                    draft_toggle.configure(text=f"▶  Drafts ({len(draft_files)})")
+                else:
+                    draft_inner.pack(fill="x", after=draft_container)
+                    draft_toggle.configure(text=f"▼  Drafts ({len(draft_files)})")
+
+            draft_toggle = ctk.CTkButton(
+                draft_container,
+                text=f"▶  Drafts ({len(draft_files)})",
+                fg_color="transparent", hover_color="#1a1a1a",
+                text_color="#888", anchor="w",
+                font=ctk.CTkFont(size=13, weight="bold"),
+                command=_toggle_drafts)
+            draft_toggle.pack(fill="x")
+            # Collapsed by default — cards rendered but not packed
+            for f in draft_files:
+                _render_video_card(draft_inner, f)
 
         # ── Scheduled section (expanded by default) ──
         if scheduled_files:
@@ -1736,11 +2285,15 @@ class App(ctk.CTk):
                 font=ctk.CTkFont(size=13, weight="bold"),
                 command=_toggle_posted)
             posted_toggle.pack(fill="x")
-            # Collapsed by default — don't pack posted_inner
+            # Render cards into posted_inner (collapsed by default)
+            for f in posted_files:
+                _render_video_card(posted_inner, f)
 
     def _select_all_outputs(self):
-        for v in self.output_vars:
-            v.set(True)
+        for var, f in self.output_items:
+            vmeta = self._get_video_status(f.name)
+            if vmeta.get("status") != "posted":
+                var.set(True)
 
     def _review_video(self, video_path):
         """Review a video using the same preview+edit screen as processing,
@@ -1748,6 +2301,8 @@ class App(ctk.CTk):
         if self._processing:
             return
         self._processing = True
+        self._in_review = True
+        self._cancelled.clear()
 
         vmeta = self._get_video_status(video_path.name)
         title = vmeta.get("title", video_path.stem)
@@ -1766,10 +2321,13 @@ class App(ctk.CTk):
             # Determine the source file for re-burns (must be raw, not already-burned)
             source = cur_raw if cur_raw.exists() else current_output
 
-            # Transcribe the source file (needed for re-burn in preview)
-            self.after(0, self._show_working, "Preparing Review", cur_title[:40])
-            whisper_result = clipper.transcribe(source)
-            self.after(0, self._hide_working)
+            # Load saved Whisper result, or re-transcribe if not found
+            whisper_result = clipper.load_whisper_result(source)
+            if whisper_result is None:
+                self.after(0, self._show_working, "Transcribing", cur_title[:40])
+                whisper_result = clipper.transcribe(source)
+                clipper.save_whisper_result(source, whisper_result)
+                self.after(0, self._hide_working)
 
             close_label = "Unschedule" if was_scheduled else "Close"
 
@@ -1787,7 +2345,7 @@ class App(ctk.CTk):
                 if choice == "draft":
                     # Save for Later — save edits, keep at processed stage
                     self._set_video_status(current_output.name,
-                                           status="ready_for_review",
+                                           status="ready_for_review", reviewed=True,
                                            title=title_final, caption=desc_final)
                     break
 
@@ -1825,10 +2383,10 @@ class App(ctk.CTk):
                         self.after(0, self._hide_working)
                         cur_raw = trimmed
 
-                    # Re-transcribe
-                    self.after(0, self._show_working, "Transcribing", title_final[:40])
-                    whisper_result = clipper.transcribe(cur_raw)
-                    self.after(0, self._hide_working)
+                        # Adjust whisper timestamps instead of re-transcribing
+                        whisper_result = clipper.trim_whisper_result(
+                            whisper_result, trim_s, trim_e, duration)
+                        clipper.save_whisper_result(cur_raw, whisper_result)
 
                     # Re-burn
                     self.after(0, self._show_working, "Burning Captions", title_final[:40])
@@ -1837,7 +2395,7 @@ class App(ctk.CTk):
                     clipper.make_ass(whisper_result, ass_path)
 
                     new_name = clipper.safe_filename(title_final, clip_date)
-                    new_path = clipper.COMPLETED_DIR / f"{new_name}.mp4"
+                    new_path = clipper.unique_output_path(clipper.COMPLETED_DIR, new_name)
                     clipper.burn_captions(cur_raw, ass_path, title_final, new_path)
                     ass_path.unlink(missing_ok=True)
 
@@ -1868,12 +2426,27 @@ class App(ctk.CTk):
                     upload_choice = self._upload_choice_dialog()
 
                     if upload_choice == "now":
-                        # Upload immediately
+                        # Upload immediately — ask per platform
+                        do_yt = False
+                        do_tt = False
+                        yt_failed = False
+                        tt_failed = False
+
+                        if clipper.YOUTUBE_CLIENT_ID:
+                            do_yt = self._confirm_dialog("YouTube", "Upload to YouTube Shorts?")
+                        if clipper.TIKTOK_CLIENT_KEY:
+                            do_tt = self._confirm_dialog("TikTok", "Upload to TikTok?")
+
+                        if not do_yt and not do_tt:
+                            # User declined both — save as needs_upload
+                            self._set_video_status(current_output.name, status="needs_upload")
+                            break
+
                         self.after(0, self._show_working, "Copying to iCloud", title_final[:40])
                         clipper.copy_to_icloud(current_output)
                         self.after(0, self._hide_working)
 
-                        if clipper.YOUTUBE_CLIENT_ID:
+                        if do_yt:
                             self.after(0, self._show_working, "Uploading to YouTube", title_final[:40])
                             url = clipper.upload_to_youtube(current_output, title_final, desc_final)
                             self.after(0, self._hide_working)
@@ -1881,31 +2454,40 @@ class App(ctk.CTk):
                                 self._set_video_status(current_output.name, youtube=True)
                                 print(f"  YouTube: {url}")
                             else:
+                                yt_failed = True
                                 self._set_video_status(current_output.name, youtube_failed=True)
                                 print(f"  YouTube upload failed")
 
-                        if clipper.TIKTOK_CLIENT_KEY:
+                        if do_tt:
                             self.after(0, self._show_working, "Uploading to TikTok", title_final[:40])
-                            publish_id = clipper.upload_to_tiktok(current_output, title_final)
+                            publish_id = clipper.upload_to_tiktok(current_output, desc_final)
                             self.after(0, self._hide_working)
                             if publish_id:
                                 self._set_video_status(current_output.name, tiktok=True)
                                 print(f"  TikTok: {publish_id}")
                             else:
+                                tt_failed = True
                                 self._set_video_status(current_output.name, tiktok_failed=True)
                                 print(f"  TikTok upload failed")
 
                         self.after(0, self._hide_working)
 
-                        # Clean up raw file
+                        # Clean up raw file and whisper cache
                         if raw_path_str and Path(raw_path_str).exists():
                             Path(raw_path_str).unlink(missing_ok=True)
+                            Path(raw_path_str).with_suffix(".whisper.json").unlink(missing_ok=True)
 
                         # Final status
                         vm = self._get_video_status(current_output.name)
                         if vm.get("youtube") or vm.get("tiktok"):
                             self._set_video_status(current_output.name, status="posted")
-                        elif vm.get("youtube_failed") or vm.get("tiktok_failed"):
+                            clipper.log_to_voice(title_final, desc_final)
+                            # Log rejection if user changed AI suggestion during review
+                            if vm.get("ai_title") or vm.get("ai_caption"):
+                                clipper.log_rejection_to_voice(
+                                    vm.get("ai_title"), title_final,
+                                    vm.get("ai_caption"), desc_final)
+                        elif yt_failed or tt_failed:
                             self._set_video_status(current_output.name, status="upload_failed")
 
                     elif upload_choice == "schedule":
@@ -1925,13 +2507,14 @@ class App(ctk.CTk):
 
         def _cleanup():
             self._processing = False
+            self._in_review = False
             self._hide_working()
             self._refresh_output_tab()
 
         self._run_in_thread(_run, on_done=_cleanup)
 
     def _delete_selected_outputs(self):
-        to_del = [self.output_files[i] for i, v in enumerate(self.output_vars) if v.get()]
+        to_del = [f for var, f in self.output_items if var.get()]
         if not to_del:
             return
 
@@ -1979,11 +2562,13 @@ class App(ctk.CTk):
                     raw = Path(raw_path_str)
                     if raw.exists():
                         raw.unlink(missing_ok=True)
+                    raw.with_suffix(".whisper.json").unlink(missing_ok=True)
                 # Remove from processed IDs if not posted (so it can be reprocessed)
                 clip_id = vmeta.get("clip_id", "")
                 if clip_id and vmeta.get("status") != "posted":
                     self._processed_ids.discard(clip_id)
                 f.unlink()
+                f.with_suffix(".thumb.jpg").unlink(missing_ok=True)
                 meta.pop(f.name, None)
                 print(f"  Deleted: {f.name}")
             self._save_video_meta(meta)
@@ -2019,6 +2604,14 @@ class App(ctk.CTk):
 
     def _on_main_mode_change(self, new_mode):
         """Handle schedule mode change from the main page selector."""
+        # Block auto/auto-post if platform is not YouTube
+        if new_mode in ("auto", "auto-post") and clipper.PLATFORM != "youtube":
+            self._main_mode_seg.set(self._schedule_mode)  # revert selector
+            self._show_toast(
+                "Auto mode requires VOD Platform = youtube. Change it in Settings first.",
+                color="#c0392b", duration=6000)
+            return
+
         self._schedule_mode = new_mode
         clipper.CLIP_MODE = new_mode
 
@@ -2037,7 +2630,7 @@ class App(ctk.CTk):
             self._time_frame.pack_forget()
 
         # Schedule/unschedule based on mode
-        if new_mode in ("auto", "auto-post") and clipper.PLATFORM == "youtube":
+        if new_mode in ("auto", "auto-post"):
             clipper.schedule()
         elif new_mode == "off" and clipper.is_scheduled():
             clipper.unschedule()
@@ -2356,36 +2949,68 @@ class App(ctk.CTk):
                              wraplength=500).pack(anchor="w", padx=10, pady=(0, 2))
 
             if section_title == "Style":
-                # ── Color theme buttons ──
-                theme_var = ctk.StringVar(value=current.get("COLOR_THEME", "blue"))
-                ctk.CTkLabel(sec_frame, text="Color Theme", anchor="w",
+                # ── Title color theme buttons ──
+                title_theme_var = ctk.StringVar(value=current.get("TITLE_COLOR_THEME", "") or current.get("COLOR_THEME", "blue"))
+                ctk.CTkLabel(sec_frame, text="Title Color", anchor="w",
                              font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(4, 0))
-                theme_row = ctk.CTkFrame(sec_frame, fg_color="transparent")
-                theme_row.pack(fill="x", padx=10, pady=(2, 0))
-                theme_btns = {}
+                title_theme_row = ctk.CTkFrame(sec_frame, fg_color="transparent")
+                title_theme_row.pack(fill="x", padx=10, pady=(2, 0))
+                title_theme_btns = {}
                 for idx, key in enumerate(clipper.COLOR_THEME_ORDER):
                     t = clipper.COLOR_THEMES[key]
                     btn = ctk.CTkButton(
-                        theme_row, text="", width=40, height=40,
+                        title_theme_row, text="", width=40, height=40,
                         fg_color=t["box"], hover_color=t["box"],
                         border_width=3,
-                        border_color="#4CAF50" if key == theme_var.get() else "#333",
+                        border_color="#4CAF50" if key == title_theme_var.get() else "#333",
                         corner_radius=6,
-                        command=lambda k=key: _select_theme(k))
+                        command=lambda k=key: _select_title_theme(k))
                     btn.pack(side="left", padx=3)
-                    theme_btns[key] = btn
+                    title_theme_btns[key] = btn
 
-                theme_name_label = ctk.CTkLabel(
+                title_theme_name_label = ctk.CTkLabel(
                     sec_frame,
-                    text=clipper.COLOR_THEMES.get(theme_var.get(), {}).get("name", ""),
+                    text=clipper.COLOR_THEMES.get(title_theme_var.get(), {}).get("name", ""),
                     text_color="#888", font=ctk.CTkFont(size=11))
-                theme_name_label.pack(anchor="w", padx=10, pady=(2, 0))
+                title_theme_name_label.pack(anchor="w", padx=10, pady=(2, 0))
 
-                def _select_theme(k):
-                    theme_var.set(k)
-                    for bk, bt in theme_btns.items():
+                def _select_title_theme(k):
+                    title_theme_var.set(k)
+                    for bk, bt in title_theme_btns.items():
                         bt.configure(border_color="#4CAF50" if bk == k else "#333")
-                    theme_name_label.configure(
+                    title_theme_name_label.configure(
+                        text=clipper.COLOR_THEMES.get(k, {}).get("name", ""))
+
+                # ── Caption color theme buttons ──
+                cap_theme_var = ctk.StringVar(value=current.get("CAPTION_COLOR_THEME", "") or current.get("COLOR_THEME", "blue"))
+                ctk.CTkLabel(sec_frame, text="Caption Color", anchor="w",
+                             font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 0))
+                cap_theme_row = ctk.CTkFrame(sec_frame, fg_color="transparent")
+                cap_theme_row.pack(fill="x", padx=10, pady=(2, 0))
+                cap_theme_btns = {}
+                for idx, key in enumerate(clipper.COLOR_THEME_ORDER):
+                    t = clipper.COLOR_THEMES[key]
+                    btn = ctk.CTkButton(
+                        cap_theme_row, text="", width=40, height=40,
+                        fg_color=t["box"], hover_color=t["box"],
+                        border_width=3,
+                        border_color="#4CAF50" if key == cap_theme_var.get() else "#333",
+                        corner_radius=6,
+                        command=lambda k=key: _select_cap_theme(k))
+                    btn.pack(side="left", padx=3)
+                    cap_theme_btns[key] = btn
+
+                cap_theme_name_label = ctk.CTkLabel(
+                    sec_frame,
+                    text=clipper.COLOR_THEMES.get(cap_theme_var.get(), {}).get("name", ""),
+                    text_color="#888", font=ctk.CTkFont(size=11))
+                cap_theme_name_label.pack(anchor="w", padx=10, pady=(2, 0))
+
+                def _select_cap_theme(k):
+                    cap_theme_var.set(k)
+                    for bk, bt in cap_theme_btns.items():
+                        bt.configure(border_color="#4CAF50" if bk == k else "#333")
+                    cap_theme_name_label.configure(
                         text=clipper.COLOR_THEMES.get(k, {}).get("name", ""))
 
                 # ── Title Y slider ──
@@ -2474,7 +3099,7 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(sched_row, text=":", text_color="#888",
                      font=ctk.CTkFont(size=12)).pack(side="left", padx=1)
-        minute_options = [f"{m:02d}" for m in range(0, 60)]
+        minute_options = [f"{m:02d}" for m in range(0, 60, 5)]
         cur_min_label = f"{(clipper.SCHEDULE_MINUTE // 5) * 5:02d}"
         if cur_min_label not in minute_options:
             cur_min_label = "00"
@@ -2515,7 +3140,8 @@ class App(ctk.CTk):
                 val = entries[key].get().strip()
                 lines.append(f"{key}={val}")
             lines.append(f"CLIP_MODE={mode_var.get()}")
-            lines.append(f"COLOR_THEME={theme_var.get()}")
+            lines.append(f"TITLE_COLOR_THEME={title_theme_var.get()}")
+            lines.append(f"CAPTION_COLOR_THEME={cap_theme_var.get()}")
             lines.append(f"TITLE_Y_PERCENT={int(title_y_var.get())}")
             lines.append(f"CAPTION_Y_PERCENT={int(cap_y_var.get())}")
             lines.append(f"SCHEDULE_HOUR={sched_hour_idx}")
@@ -2541,7 +3167,8 @@ class App(ctk.CTk):
             clipper.ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
             clipper.CLIP_LENGTH = float(os.getenv("CLIP_LENGTH", "2"))
             clipper.CLIP_MODE = mode_var.get()
-            clipper.COLOR_THEME = theme_var.get()
+            clipper.TITLE_COLOR_THEME = title_theme_var.get()
+            clipper.CAPTION_COLOR_THEME = cap_theme_var.get()
             clipper.TITLE_Y_PERCENT = float(int(title_y_var.get()))
             clipper.CAPTION_Y_PERCENT = float(int(cap_y_var.get()))
             clipper.SCHEDULE_HOUR = sched_hour_idx
@@ -2829,6 +3456,52 @@ class App(ctk.CTk):
         self._wait_or_cancel(event)
         return result[0]
 
+    def _mark_posted_dialog(self, video_path, missing_yt, missing_tt):
+        """Show checkboxes for which platforms the user manually posted to."""
+        self._show_overlay()
+        ov = self.overlay
+
+        ctk.CTkLabel(ov, text="Mark as Posted",
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(60, 4))
+        ctk.CTkLabel(ov, text="Which platforms did you post this to?",
+                     font=ctk.CTkFont(size=13), text_color="#aaa").pack(pady=(0, 12))
+
+        yt_var = ctk.BooleanVar(value=False)
+        tt_var = ctk.BooleanVar(value=False)
+
+        checks = ctk.CTkFrame(ov, fg_color="transparent")
+        checks.pack(pady=(0, 12))
+
+        if missing_yt:
+            ctk.CTkCheckBox(checks, text="YouTube", variable=yt_var,
+                            font=ctk.CTkFont(size=13)).pack(anchor="w", pady=2)
+        if missing_tt:
+            ctk.CTkCheckBox(checks, text="TikTok", variable=tt_var,
+                            font=ctk.CTkFont(size=13)).pack(anchor="w", pady=2)
+
+        btn_row = ctk.CTkFrame(ov, fg_color="transparent")
+        btn_row.pack()
+
+        def _confirm():
+            updates = {}
+            if yt_var.get():
+                updates["youtube"] = True
+                updates["youtube_failed"] = False
+            if tt_var.get():
+                updates["tiktok"] = True
+                updates["tiktok_failed"] = False
+            if updates:
+                updates["status"] = "posted"
+                self._set_video_status(video_path.name, **updates)
+            self._hide_overlay()
+            self._refresh_output_tab()
+
+        ctk.CTkButton(btn_row, text="Save", width=100, fg_color="#1D8CD7",
+                       font=ctk.CTkFont(size=13, weight="bold"),
+                       command=_confirm).pack(side="left", padx=6)
+        ctk.CTkButton(btn_row, text="Cancel", width=80, fg_color="#555",
+                       command=lambda: (self._hide_overlay())).pack(side="left", padx=6)
+
     def _upload_choice_dialog(self):
         """Show upload options: Upload Now / Schedule Post / Not Now.
         Returns 'now', 'schedule', or 'not_now'."""
@@ -2925,7 +3598,7 @@ class App(ctk.CTk):
             ctk.CTkLabel(time_row, text=":", text_color="#888",
                          font=ctk.CTkFont(size=12)).pack(side="left", padx=2)
 
-            min_opts = [f"{m:02d}" for m in range(0, 60, 30)]
+            min_opts = [f"{m:02d}" for m in range(0, 60, 5)]
             min_var = ctk.StringVar(value="00")
             ctk.CTkOptionMenu(time_row, values=min_opts, variable=min_var,
                                width=60, height=28,
@@ -2988,6 +3661,16 @@ class App(ctk.CTk):
             self._active_player = player
             ctrl = player["ctrl_frame"]
 
+            # Re-trim button next to player controls
+            def _retrim():
+                player["stop"]()
+                self._active_player = None
+                result["choice"] = "retrim"
+                self._hide_overlay()
+                event.set()
+            ctk.CTkButton(ctrl, text="✂ Re-trim", width=100, fg_color="#555",
+                           font=ctk.CTkFont(size=11), command=_retrim).pack(side="left", padx=4)
+
             # ── Editable title & caption ──
             ctk.CTkFrame(scroll, height=1, fg_color="#444").pack(fill="x", padx=24, pady=(8, 4))
 
@@ -3015,38 +3698,73 @@ class App(ctk.CTk):
             # ── Style controls (per-clip, initialized from current defaults) ──
             ctk.CTkFrame(edit_frame, height=1, fg_color="#333").pack(fill="x", padx=10, pady=(4, 4))
 
-            # Color theme
-            style_theme_var = ctk.StringVar(value=clipper.COLOR_THEME)
-            theme_label_row = ctk.CTkFrame(edit_frame, fg_color="transparent")
-            theme_label_row.pack(fill="x", padx=10, pady=(2, 0))
-            ctk.CTkLabel(theme_label_row, text="Color", width=60, anchor="w",
+            # Title color theme
+            style_title_theme_var = ctk.StringVar(value=clipper.TITLE_COLOR_THEME)
+            title_theme_label_row = ctk.CTkFrame(edit_frame, fg_color="transparent")
+            title_theme_label_row.pack(fill="x", padx=10, pady=(2, 0))
+            ctk.CTkLabel(title_theme_label_row, text="Title Color", width=80, anchor="w",
                          font=ctk.CTkFont(size=12, weight="bold")).pack(side="left")
-            style_theme_name = ctk.CTkLabel(
-                theme_label_row,
-                text=clipper.COLOR_THEMES.get(clipper.COLOR_THEME, {}).get("name", ""),
+            style_title_theme_name = ctk.CTkLabel(
+                title_theme_label_row,
+                text=clipper.COLOR_THEMES.get(clipper.TITLE_COLOR_THEME, {}).get("name", ""),
                 text_color="#888", font=ctk.CTkFont(size=11))
-            style_theme_name.pack(side="left", padx=(4, 0))
+            style_title_theme_name.pack(side="left", padx=(4, 0))
 
-            theme_row = ctk.CTkFrame(edit_frame, fg_color="transparent")
-            theme_row.pack(fill="x", padx=10, pady=(2, 0))
-            style_theme_btns = {}
+            title_theme_row = ctk.CTkFrame(edit_frame, fg_color="transparent")
+            title_theme_row.pack(fill="x", padx=10, pady=(2, 0))
+            style_title_theme_btns = {}
             for key in clipper.COLOR_THEME_ORDER:
                 t = clipper.COLOR_THEMES[key]
                 btn = ctk.CTkButton(
-                    theme_row, text="", width=36, height=36,
+                    title_theme_row, text="", width=36, height=36,
                     fg_color=t["box"], hover_color=t["box"],
                     border_width=3,
-                    border_color="#4CAF50" if key == style_theme_var.get() else "#333",
+                    border_color="#4CAF50" if key == style_title_theme_var.get() else "#333",
                     corner_radius=6,
-                    command=lambda k=key: _select_style_theme(k))
+                    command=lambda k=key: _select_title_theme(k))
                 btn.pack(side="left", padx=2)
-                style_theme_btns[key] = btn
+                style_title_theme_btns[key] = btn
 
-            def _select_style_theme(k):
-                style_theme_var.set(k)
-                for bk, bt in style_theme_btns.items():
+            def _select_title_theme(k):
+                style_title_theme_var.set(k)
+                for bk, bt in style_title_theme_btns.items():
                     bt.configure(border_color="#4CAF50" if bk == k else "#333")
-                style_theme_name.configure(
+                style_title_theme_name.configure(
+                    text=clipper.COLOR_THEMES.get(k, {}).get("name", ""))
+                _check_needs_reburn()
+
+            # Caption color theme
+            style_cap_theme_var = ctk.StringVar(value=clipper.CAPTION_COLOR_THEME)
+            cap_theme_label_row = ctk.CTkFrame(edit_frame, fg_color="transparent")
+            cap_theme_label_row.pack(fill="x", padx=10, pady=(6, 0))
+            ctk.CTkLabel(cap_theme_label_row, text="Caption Color", width=80, anchor="w",
+                         font=ctk.CTkFont(size=12, weight="bold")).pack(side="left")
+            style_cap_theme_name = ctk.CTkLabel(
+                cap_theme_label_row,
+                text=clipper.COLOR_THEMES.get(clipper.CAPTION_COLOR_THEME, {}).get("name", ""),
+                text_color="#888", font=ctk.CTkFont(size=11))
+            style_cap_theme_name.pack(side="left", padx=(4, 0))
+
+            cap_theme_row = ctk.CTkFrame(edit_frame, fg_color="transparent")
+            cap_theme_row.pack(fill="x", padx=10, pady=(2, 0))
+            style_cap_theme_btns = {}
+            for key in clipper.COLOR_THEME_ORDER:
+                t = clipper.COLOR_THEMES[key]
+                btn = ctk.CTkButton(
+                    cap_theme_row, text="", width=36, height=36,
+                    fg_color=t["box"], hover_color=t["box"],
+                    border_width=3,
+                    border_color="#4CAF50" if key == style_cap_theme_var.get() else "#333",
+                    corner_radius=6,
+                    command=lambda k=key: _select_cap_theme(k))
+                btn.pack(side="left", padx=2)
+                style_cap_theme_btns[key] = btn
+
+            def _select_cap_theme(k):
+                style_cap_theme_var.set(k)
+                for bk, bt in style_cap_theme_btns.items():
+                    bt.configure(border_color="#4CAF50" if bk == k else "#333")
+                style_cap_theme_name.configure(
                     text=clipper.COLOR_THEMES.get(k, {}).get("name", ""))
                 _check_needs_reburn()
 
@@ -3100,12 +3818,14 @@ class App(ctk.CTk):
             save_default_btn.pack_forget()
 
             original_title = [title]
-            original_style = [clipper.COLOR_THEME, int(clipper.TITLE_Y_PERCENT), int(clipper.CAPTION_Y_PERCENT)]
+            original_style = [clipper.TITLE_COLOR_THEME, clipper.CAPTION_COLOR_THEME,
+                              int(clipper.TITLE_Y_PERCENT), int(clipper.CAPTION_Y_PERCENT)]
 
             def _style_changed():
-                return (style_theme_var.get() != original_style[0]
-                        or int(style_title_y.get()) != original_style[1]
-                        or int(style_cap_y.get()) != original_style[2])
+                return (style_title_theme_var.get() != original_style[0]
+                        or style_cap_theme_var.get() != original_style[1]
+                        or int(style_title_y.get()) != original_style[2]
+                        or int(style_cap_y.get()) != original_style[3])
 
             def _check_needs_reburn(*_):
                 new_title = title_entry.get().strip()
@@ -3119,12 +3839,17 @@ class App(ctk.CTk):
                         reasons.append("style")
                     reburn_hint.configure(text=f"{' & '.join(reasons).capitalize()} changed — re-burn to update")
                     reburn_btn.pack(side="right", padx=(8, 0))
+                    # Disable "Looks Good" until reburn is done
+                    looks_good_btn.configure(state="disabled")
                 else:
                     reburn_hint.configure(text="")
                     reburn_btn.pack_forget()
+                    looks_good_btn.configure(state="normal")
                 # Show save-as-default if style differs from saved defaults
-                cur_defaults = [clipper.COLOR_THEME, int(clipper.TITLE_Y_PERCENT), int(clipper.CAPTION_Y_PERCENT)]
-                cur_style = [style_theme_var.get(), int(style_title_y.get()), int(style_cap_y.get())]
+                cur_defaults = [clipper.TITLE_COLOR_THEME, clipper.CAPTION_COLOR_THEME,
+                                int(clipper.TITLE_Y_PERCENT), int(clipper.CAPTION_Y_PERCENT)]
+                cur_style = [style_title_theme_var.get(), style_cap_theme_var.get(),
+                             int(style_title_y.get()), int(style_cap_y.get())]
                 if cur_style != cur_defaults:
                     save_default_btn.pack(side="right", padx=(4, 0))
                 else:
@@ -3135,7 +3860,8 @@ class App(ctk.CTk):
             def _save_as_default():
                 """Save current style values as defaults in .env and clipper globals."""
                 env_path = Path(__file__).parent / ".env"
-                new_theme = style_theme_var.get()
+                new_title_theme = style_title_theme_var.get()
+                new_cap_theme = style_cap_theme_var.get()
                 new_title_y = int(style_title_y.get())
                 new_cap_y = int(style_cap_y.get())
 
@@ -3149,8 +3875,14 @@ class App(ctk.CTk):
                 for line in lines:
                     stripped = line.strip()
                     if stripped.startswith("COLOR_THEME="):
-                        new_lines.append(f"COLOR_THEME={new_theme}")
-                        updated_keys.add("COLOR_THEME")
+                        # Remove legacy single COLOR_THEME
+                        continue
+                    elif stripped.startswith("TITLE_COLOR_THEME="):
+                        new_lines.append(f"TITLE_COLOR_THEME={new_title_theme}")
+                        updated_keys.add("TITLE_COLOR_THEME")
+                    elif stripped.startswith("CAPTION_COLOR_THEME="):
+                        new_lines.append(f"CAPTION_COLOR_THEME={new_cap_theme}")
+                        updated_keys.add("CAPTION_COLOR_THEME")
                     elif stripped.startswith("TITLE_Y_PERCENT="):
                         new_lines.append(f"TITLE_Y_PERCENT={new_title_y}")
                         updated_keys.add("TITLE_Y_PERCENT")
@@ -3160,8 +3892,10 @@ class App(ctk.CTk):
                     else:
                         new_lines.append(line)
                 # Append any missing keys
-                if "COLOR_THEME" not in updated_keys:
-                    new_lines.append(f"COLOR_THEME={new_theme}")
+                if "TITLE_COLOR_THEME" not in updated_keys:
+                    new_lines.append(f"TITLE_COLOR_THEME={new_title_theme}")
+                if "CAPTION_COLOR_THEME" not in updated_keys:
+                    new_lines.append(f"CAPTION_COLOR_THEME={new_cap_theme}")
                 if "TITLE_Y_PERCENT" not in updated_keys:
                     new_lines.append(f"TITLE_Y_PERCENT={new_title_y}")
                 if "CAPTION_Y_PERCENT" not in updated_keys:
@@ -3169,14 +3903,16 @@ class App(ctk.CTk):
                 env_path.write_text("\n".join(new_lines) + "\n")
 
                 # Update clipper globals
-                clipper.COLOR_THEME = new_theme
+                clipper.TITLE_COLOR_THEME = new_title_theme
+                clipper.CAPTION_COLOR_THEME = new_cap_theme
                 clipper.TITLE_Y_PERCENT = float(new_title_y)
                 clipper.CAPTION_Y_PERCENT = float(new_cap_y)
 
                 # Update tracking so button hides
-                original_style[0] = new_theme
-                original_style[1] = new_title_y
-                original_style[2] = new_cap_y
+                original_style[0] = new_title_theme
+                original_style[1] = new_cap_theme
+                original_style[2] = new_title_y
+                original_style[3] = new_cap_y
                 save_default_btn.pack_forget()
                 self._show_toast("Defaults saved", "#4CAF50", duration=2000)
 
@@ -3193,7 +3929,8 @@ class App(ctk.CTk):
 
                 # Apply per-clip style to clipper globals before re-burn
                 result["style"] = {
-                    "theme": style_theme_var.get(),
+                    "title_theme": style_title_theme_var.get(),
+                    "cap_theme": style_cap_theme_var.get(),
                     "title_y": int(style_title_y.get()),
                     "cap_y": int(style_cap_y.get()),
                 }
@@ -3221,13 +3958,6 @@ class App(ctk.CTk):
                 self._hide_overlay()
                 event.set()
 
-            def _retrim():
-                player["stop"]()
-                self._active_player = None
-                result["choice"] = "retrim"
-                self._hide_overlay()
-                event.set()
-
             def _draft():
                 player["stop"]()
                 self._active_player = None
@@ -3244,13 +3974,12 @@ class App(ctk.CTk):
                 self._hide_overlay()
                 event.set()
 
-            ctk.CTkButton(btn_row, text="Looks Good", width=120, fg_color="#1D8CD7",
+            looks_good_btn = ctk.CTkButton(btn_row, text="Looks Good", width=120, fg_color="#1D8CD7",
                            font=ctk.CTkFont(size=13, weight="bold"),
-                           command=_approve).pack(side="left", padx=6)
+                           command=_approve)
+            looks_good_btn.pack(side="left", padx=6)
             ctk.CTkButton(btn_row, text="Save for Later", width=100, fg_color="#555",
                            command=_draft).pack(side="left", padx=6)
-            ctk.CTkButton(btn_row, text="Re-trim", width=100, fg_color="#555",
-                           command=_retrim).pack(side="left", padx=6)
             ctk.CTkButton(btn_row, text=skip_label, width=90, fg_color="#555",
                            text_color="#c0392b", command=_skip).pack(side="left", padx=6)
 
@@ -3268,7 +3997,8 @@ class App(ctk.CTk):
             # Apply per-clip style overrides to clipper globals for re-burn
             style = result.get("style")
             if style:
-                clipper.COLOR_THEME = style["theme"]
+                clipper.TITLE_COLOR_THEME = style["title_theme"]
+                clipper.CAPTION_COLOR_THEME = style["cap_theme"]
                 clipper.TITLE_Y_PERCENT = float(style["title_y"])
                 clipper.CAPTION_Y_PERCENT = float(style["cap_y"])
 
@@ -3278,13 +4008,20 @@ class App(ctk.CTk):
             clipper.make_ass(whisper_result, ass_path)
 
             new_output_name = clipper.safe_filename(new_title, clip_date)
-            new_output_path = clipper.COMPLETED_DIR / f"{new_output_name}.mp4"
+            new_output_path = clipper.unique_output_path(clipper.COMPLETED_DIR, new_output_name)
             clipper.burn_captions(video_path, ass_path, new_title, new_output_path)
             ass_path.unlink(missing_ok=True)
 
-            # Delete old output if different
-            if output_path != new_output_path and output_path.exists():
-                output_path.unlink(missing_ok=True)
+            # Migrate metadata and delete old output if filename changed
+            if output_path != new_output_path:
+                meta = self._load_video_meta()
+                old_meta = meta.pop(output_path.name, {})
+                old_meta.update(title=new_title, caption=new_desc,
+                                raw_path=str(video_path))
+                meta[new_output_path.name] = old_meta
+                self._save_video_meta(meta)
+                if output_path.exists():
+                    output_path.unlink(missing_ok=True)
 
             self.after(0, self._hide_working)
             print(f"  Re-burned with title: {new_title}")

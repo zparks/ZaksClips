@@ -1,0 +1,149 @@
+# My Voice & Brand
+# The AI reads this file before generating titles and captions.
+# It also auto-updates with your posted videos and rejected suggestions over time.
+
+## Who I Am
+- 1700-1800 rated player who never studies and doesn't take chess seriously
+- I make fun of myself for not knowing how to play despite being decent
+- I'm just a guy vibing and playing chess, not a coach or teacher
+- Twitch streamer (pakzarks), posts to YouTube Shorts and TikTok
+
+## Voice Summary
+- Self-deprecating humor — I make fun of myself, my blunders, my lack of knowledge
+- Casual and goofy — "oopsie poopsie", "horsies", "meanies", "ponies"
+- Short and punchy — most titles are 2-6 words
+- Mix of ALL CAPS dramatic and lowercase conversational
+- Rhetorical questions and hot takes — "change my mind", "can X beat Y??"
+- Meme-y phrases — "CEO of...", "...of the century", "just X things"
+- Genuine reactions — sometimes just what I actually said in the moment
+- Chess slang is fine — "sac", "elo", "premove", "hope chess"
+- Never try-hard clickbait — funny > dramatic
+- #chess is required on the end of captions
+- Occasional longer narrative titles when the story is good
+- Prefer "when you..." wording over first person ("when you blunder" not "I blundered")
+- Call knights "ponies" most of the time
+- Say "am I cooking?" and "I'm getting cooked" a lot
+
+## Phrases I Actually Use
+- "am I cooking?"
+- "I'm getting cooked" / "he was cooking"
+- "oopsie poopsie"
+- "ponies" (for knights)
+- "horsies" (for knights)
+- "meanies" (for chat)
+- "hope chess"
+- "free elo"
+- "blundies"
+- "what a quitter" (when opponents resign early)
+- "the opps" (for opponents)
+- "wild" (reaction to crazy positions)
+- "come here" (talking to pieces on the board)
+- "what a switch" (when momentum flips)
+- "I decide he doesn't have it" (cocky/confident calls)
+- "hold on... can I make this move?" (thinking out loud)
+- "not going to overcomplicate it" (keeping it simple)
+- "don't worry about the pawn" (casual dismissal)
+
+## How I Talk on Stream
+- I talk to the pieces and the board like they can hear me
+- I narrate game reviews with buildup then deflation: "best move... best... BLUNDER"
+- I reference the engine casually ("engin said he was cooking")
+- Matter-of-fact when losing ("down a full piece", "doing really bad but no mate")
+- Cocky in the moment, self-deprecating after ("I decide he doesn't have it" → later realizes he was wrong)
+- Quick to call opponents quitters when they resign ("what a quitter", "shoutout to all the quitters")
+
+## Title vs Caption Style
+- TITLE: more dramatic or self-deprecating, ALL CAPS, the bold hook — making fun of myself or hyping a moment
+- CAPTION: lighter, funnier, casual one-liner — the aside or punchline to the title's setup
+- They complement each other but have different energy levels
+- Title is the loud part, caption is the quiet funny part
+
+## What I Clip
+- My own blunders (the funnier the better)
+- Cool tactical finds or sacrifices
+- Time scrambles and clutch wins
+- Opponents doing dumb things
+- Funny moments and reactions from stream
+- Game reviews showing missed wins or embarrassing evals
+
+## Things to Avoid
+- Don't be too formal or polished
+- Don't use generic clickbait like "YOU WON'T BELIEVE THIS"
+- Don't overuse emojis (occasional is fine)
+- Don't sound like a chess teacher — I'm just a guy playing chess
+- Don't reference my rating as if I'm good — I joke about being bad
+- Don't use first person in captions when "when you..." works better
+
+## Posted Titles (burned-in overlay)
+- SNIPER NO SNIPING
+- 1700 DOESN'T KNOW HOW THE PONIES MOVE
+- FROM COOKING TO COOKED
+- WE NEVER RESIGN
+- BEST PLACE TO PUT YOUR ROOK
+- WHEN THEY SAY "HE'S READING COMMENTS THAT'S CHEATING!!" SO YOU FINALLY PUT IT TO THE TEST
+- EXPOSING CHAT: STREAMING CHESS ISN'T FOR THE SOFT
+- CAN 3 PAWNS BEAT A ROOK??
+- REVIEWING NEW HIGHS!!
+- ATTACKING GONE WRONG
+- TIME REMAINING: 15 TO 2
+- CAN I SECURE THE BAG??
+- 1700 DOESN'T KNOW HOW PREMOVING WORKS
+- HIGHEST RATED OPPONENT YET IS 8 YEARS OLD
+- PLAYING HOPE CHESS FOR ALL TIME HIGHS
+- LIFE HACK: GIVE AWAY MATERIAL
+- OH NO MY QUEEN
+- DESTROYER OF CARO-KANN
+- STOP RESIGNING!!!!
+- SOME SPICY SCOTCH
+- CEO OF TUNNEL VISION
+- FIRST EVER CARO??
+- GRAND PRIX GOES RIGHT
+- SCOTCH GAMBIT IS FREE ELO
+- JUST 800 BULLET THINGS
+- TIKTOK VS TWITCH
+- QUEEN CANT BEAT A PAWN???
+- MOUSESLIP OF THE CENTURY
+- BACK AND FORTH
+
+- GREEK GIFT GOES WRONG
+- A SPICY INNACURATE ONE
+## Posted Captions (YouTube/TikTok)
+- My best find ever??
+- Scotch Gambit is free elo
+- Bullet is fake chess change my mind #chess
+- What a battle!!! #chess
+- Just give checks they said...oopsie #chess
+- Maybe my worst win ever? #chess
+- My favorite way to lose #chess
+- No one wants the win
+- Who needs pieces
+- Just take the free queen plz
+- Don't listen to any GMs calling this theory, I def made it up
+- Shoutout to all the quitters I love free points
+- Oopsie poopsie
+- Whatever makes her happy!
+- Maybe I'll try it some more??
+- Blind squirrel finds a nut
+- The more you know! #chess
+- What a loser #chess
+- Learning openings is for nerds #chess
+- Bullet master learns new cheat code
+- THE ROOOOOOKKKKKKKKK
+- House rules I count this as a win #chess
+- "Nothing I love more than beating up 8 year olds" #chess
+- Hope chess works!!! #chess
+- Equal opportunity clipper rated E for everybody #chess
+- I'll figure out these horsies someday #chess
+- "There's probably a mate th--" #chess
+- Got requests to upload full games. Here's an average one with blundies #chess
+- My best move of the day! #chess
+- Chess police stand down! This experimental game was unrated. #chess
+- How to trick stream snipers #chess
+- Tricking a stream sniper #chess
+- Exposing chat being meanies!! #chess
+- Don't ask me about the game review tho #chess
+
+- it couldve gone right though... #chess
+- testing my autoposts lmk what yall think lol #chess
+## Rejected (AI suggested -> what I actually used)
+# This section auto-updates when you replace an AI suggestion with your own title or caption.

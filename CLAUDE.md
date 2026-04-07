@@ -21,12 +21,15 @@ Full desktop app wrapping clipper.py with customtkinter (dark mode).
 
 ### Home screen = My Videos
 - No tabs — My Videos is the main screen, "Get Clips" opens the manual flow as an overlay
-- Three sections: **Active** (drafts/approved/failed — always visible), **Scheduled** (expanded by default, collapsible), **Posted** (collapsed by default, expandable)
-- Each video card shows: title, date/size/auto tag, progress dots (● Processed → ● Approved → ● Posted)
+- Four sections: **Active** (ready_for_review/approved/failed — always visible), **Drafts** (collapsed by default, "maybe later" clips), **Scheduled** (expanded by default, collapsible), **Posted** (collapsed by default, expandable)
+- Each video card shows: thumbnail (45x80, cached to `.thumb.jpg`), title, date/size/stream title/VOD window/auto tag, progress dots (● Processed → ● Approved → ● Posted)
 - Progress dot states: green ● = done, orange ● = needs attention, ◷ = scheduled (blue, shows date/time), ✕ = failed (red)
-- Buttons adapt by status: "Review" (orange) for unreviewed, "Edit" (gray) for approved/scheduled, "Unschedule" (red) + "Edit" for scheduled
-- "Get Clips" button adapts: prominent blue in off mode, gray "Get Clips Manually" in auto/auto-post mode
-- Empty state adapts: big "Get Clips" CTA in off mode, "your clips will be processed at Xam" + "Process Now" in auto mode
+- Buttons adapt by status: "Review" (orange) for unreviewed, "Edit" (gray) for approved/scheduled, "Unschedule" (red) + "Edit" for scheduled, "Draft" (subtle) to shelve, "Undraft" on draft cards
+- "Mark Posted" button appears on approved/failed/partially-posted cards — lets user manually flag platforms they posted to
+- "Get Clips" button always blue, same label in all modes
+- Empty state: big "Get Clips" CTA, subtle "or wait for your next scheduled run at Xpm" in auto modes
+- Select All / Delete Selected only shown when there are videos
+- New clip toast: green notification when new videos appear (from batch or auto process)
 
 ### Schedule modes (top bar selector: off | auto | auto-post)
 - **off** — no schedule, manual workflow only
@@ -36,9 +39,12 @@ Full desktop app wrapping clipper.py with customtkinter (dark mode).
 - Schedule saved to `.env` as `SCHEDULE_HOUR` and `SCHEDULE_MINUTE`, launchd job auto-managed
 
 ### Processing flow (Get Clips overlay)
-- Fetch clips → select (already-processed shown as "(already in My Videos)", unchecked by default) → process
-- Steps are display-only progress bar (not clickable)
-- Always interactive: trim → title → caption → burn → preview+edit → upload
+- Fetch clips → select (already-processed shown as "(already in My Videos)", unchecked by default)
+- Two processing modes: **Auto Process** (green, no interaction) and **Manually Process** (blue, full interactive)
+- Auto/Manual/Select All buttons hidden until clips are fetched
+- **Auto Process**: download → transcribe → AI title/caption → burn → queue for review. No prompts.
+- **Manually Process**: trim → title → caption → burn → preview+edit → upload (full interactive)
+- Steps are display-only progress bar (not clickable, manual mode only)
 - Preview+edit screen (`_preview_and_approve`): video player, editable title/caption, color theme picker, position sliders, re-burn, "Save as Default"
 - Buttons: "Looks Good" → "Save for Later" → "Re-trim" → "Discard"
 - After "Looks Good": "Upload Now" / "Schedule Post" / "Not Now"
@@ -47,18 +53,23 @@ Full desktop app wrapping clipper.py with customtkinter (dark mode).
 
 ### Review/Edit flow (from My Videos)
 - Uses the same `_preview_and_approve` screen as processing — full editing capabilities
+- **Instant open** — loads cached Whisper result (`.whisper.json`) instead of re-transcribing (~10-15s saved). Falls back to transcribe if cache missing.
 - Buttons adapt: "Close" normally, "Unschedule" for scheduled videos
 - Re-burn uses raw file (never burns on top of already-burned output)
+- **Trim skips transcription** — when trimming shorter, adjusts existing Whisper timestamps instead of re-running Whisper. Only re-transcribes when extending (re-downloading).
 - On approve → upload choice → iCloud copy + upload + raw cleanup
 
 ### Video metadata (`.video_meta.json`)
-- Tracks per-video: status, date, mode, title, caption, raw_path, youtube/tiktok flags, scheduled_time
-- Statuses: `ready_for_review`, `approved`, `needs_upload`, `scheduled`, `posted`, `upload_failed`
+- Tracks per-video: status, date, mode, title, caption, raw_path, youtube/tiktok flags, scheduled_time, stream_title, vod_window, ai_title, ai_caption
+- Statuses: `ready_for_review`, `approved`, `needs_upload`, `scheduled`, `posted`, `upload_failed`, `draft`
 - Written by both GUI and batch processor
 
 ### Other GUI features
-- Embedded video player with synced audio (PyAV + sounddevice)
+- Embedded video player with synced audio (PyAV + sounddevice, audio hardware clock sync)
+- Trackpad/mousewheel scrolling (Tk 9 `<TouchpadScroll>` support, clamped speed)
 - All dialogs are inline overlays (`_show_overlay`/`_hide_overlay`)
+- All stdout (including subprocess output) routes to GUI log panel via OS-level fd redirect
+- Batch worker.log output loads into log panel on Refresh / opening Logs (truncated each batch run)
 - Help button: renders README.md inline
 - Settings hot-reloads .env into clipper globals
 - Escape closes overlays or cancels processing
@@ -128,7 +139,9 @@ Full desktop app wrapping clipper.py with customtkinter (dark mode).
 - **Persistent browser session** — saved to `.browser_session/`, user logs into TikTok once, stays logged in
 - **Day-by-day clip fetching** — Twitch Helix clips endpoint sorts by views on wide date ranges and drops low-view clips. Fetching day-by-day ensures all clips are found.
 - **YouTube VOD matching checks day before** — streams that start before midnight UTC produce clips timestamped the next day. VOD search matches both the clip date and the previous day.
-- **Local trimming** — when shortening a segment (-N or e-N), ffmpeg crops locally instead of re-downloading. Only extends (+N or e+N) trigger a re-download.
+- **Local trimming** — when shortening a segment (-N or e-N), ffmpeg re-encodes locally (`-preset fast -crf 18`) for frame-accurate cuts instead of re-downloading. Only extends (+N or e+N) trigger a re-download.
+- **Frame-accurate downloads** — yt-dlp uses `--force-keyframes-at-cuts` to get exact segment durations.
+- **Whisper result caching** — saved as `.whisper.json` alongside raw video. Review loads instantly, trims adjust timestamps without re-transcribing.
 - **iCloud Drive sync** — finished videos auto-copy to `~/Library/Mobile Documents/com~apple~CloudDocs/ZaksClips/` for phone access via Files app.
 
 ## Segment adjustment
@@ -143,9 +156,10 @@ After downloading, user can adjust timing before captions are burned:
 
 ## Caption & title styling
 
-- **7 color themes** — Classic White, Classic Black, Electric Blue (default), Fire Red, Neon Green, Royal Purple, Gold. Stored as `COLOR_THEME` in `.env`. Theme color applies to both title box and caption outline. Text color auto-picks black or white for contrast.
+- **7 color themes** — Classic White, Classic Black, Electric Blue (default), Fire Red, Neon Green, Royal Purple, Gold. Text color auto-picks black or white for contrast.
+- **Separate title & caption colors** — `TITLE_COLOR_THEME` and `CAPTION_COLOR_THEME` in `.env` (falls back to legacy `COLOR_THEME` if not set). Title color controls the title box, caption color controls the caption outline.
 - **Adjustable positions** — `TITLE_Y_PERCENT` (default 59) and `CAPTION_Y_PERCENT` (default 65) control vertical placement as % from top. Configurable via sliders in both the preview/edit screen and Settings.
-- **Per-clip style controls** — Color theme, title height, and caption height are editable on the preview/approve screen. Changing any triggers the "Re-burn" button. "Save as Default" persists style to `.env` for future clips. Settings page still shows/edits defaults.
+- **Per-clip style controls** — Title color, caption color, title height, and caption height are editable on the preview/approve screen. Changing any triggers the "Re-burn" button. "Save as Default" persists style to `.env` for future clips. Settings page still shows/edits defaults.
 - **Captions are one line max** — Whisper word-level timestamps chunked at ~30 chars, no long wrapping segments
 - **No punctuation in captions** — commas, periods, etc. stripped via regex
 - **All caps** — both captions and title are uppercased
@@ -242,3 +256,13 @@ Requires:
 - In danger mode: AI title/caption are used automatically with no prompts
 - Falls back to Twitch clip title if no API key or if generation fails
 - `anthropic` package installed via pip (not in venv)
+
+### Voice file (`voice.txt`)
+- `voice.txt` in project root defines the creator's voice/brand for AI-generated titles and captions
+- Read by `generate_title_caption()` every call and injected into the Claude prompt as a style guide
+- Seeded with 35 YouTube Shorts titles/captions and ~30 burned-in video titles from the channel
+- **Auto-updates on post**: when a video's status changes to `posted`, the final title and caption are appended to the "Posted" sections
+- **Tracks rejections**: when the user changes an AI-suggested title or caption, both the AI version and the user's replacement are logged to the "Rejected" section so Haiku learns what NOT to generate
+- `ai_title` and `ai_caption` are stored in `.video_meta.json` per video so rejections can be detected even during later review
+- `clipper.log_to_voice(title, caption)` — appends posted title/caption
+- `clipper.log_rejection_to_voice(ai_title, user_title, ai_caption, user_caption)` — logs rejected suggestions

@@ -123,6 +123,22 @@ A colored banner appears at the top of the app when you're in Auto (orange) or D
 |---------|-------------|
 | **Anthropic API Key** | Your API key from [console.anthropic.com](https://console.anthropic.com). When set, the app sends each clip's transcript to Claude to generate a punchy ALL CAPS title and a quirky caption ending with `#chess`. In Safe mode, the AI suggestion is pre-filled but you can edit it. In Auto/Danger mode, it's used automatically. If no key is set, falls back to the Twitch clip title. |
 
+### Voice File (`voice.txt`)
+
+Create a `voice.txt` file in the project root to teach the AI your personal style. The AI reads this before generating every title and caption. Without it, you get generic chess content titles.
+
+**What to put in it:**
+- How you talk (sarcastic, hype, chill, goofy, etc.)
+- Phrases you actually say on stream
+- Example titles and captions you like
+- Things to avoid ("no emojis", "don't be formal", etc.)
+
+**Auto-learning:** The voice file updates itself over time:
+- When you post a video, the title and caption are logged as examples
+- When you reject an AI suggestion and write your own, both versions are logged so the AI learns what NOT to generate
+
+The more you use the app, the better it gets at sounding like you.
+
 ### Credential Status
 
 The colored indicators below the title bar show connection status at a glance:
