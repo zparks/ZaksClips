@@ -5,22 +5,67 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Privacy Policy — ZaksClips</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; color: #e0e0e0; background: #111; }
-    h1 { font-size: 1.5rem; }
-    p { line-height: 1.6; }
+    body { font-family: system-ui, sans-serif; max-width: 680px; margin: 60px auto; padding: 0 20px; color: #e0e0e0; background: #111; }
+    h1 { font-size: 1.6rem; margin-bottom: 4px; }
+    h2 { font-size: 1.1rem; margin-top: 32px; color: #fff; }
+    p, li { line-height: 1.7; }
+    ul { padding-left: 20px; }
+    a { color: #7eb8f7; }
+    .updated { color: #888; font-size: 0.9rem; margin-top: 0; }
   </style>
 </head>
 <body>
   <h1>Privacy Policy</h1>
-  <p><strong>Last updated:</strong> April 7, 2026</p>
-  <p>ZaksClips is a personal tool that runs entirely on your local machine. Here's how it handles data:</p>
+  <p class="updated"><strong>Last updated:</strong> April 9, 2026</p>
+
+  <p>ZaksClips ("the Application") is a desktop tool that helps content creators automate the clip workflow for streaming platforms. This Privacy Policy explains what data the Application accesses, how it is used, and your rights as a user.</p>
+
+  <h2>1. Data We Access</h2>
+  <p>ZaksClips connects to third-party platforms on your behalf using OAuth 2.0. The following data may be accessed:</p>
   <ul>
-    <li><strong>No data collection.</strong> ZaksClips does not collect, store, or transmit any personal data to any server. All processing happens locally.</li>
-    <li><strong>API credentials</strong> (Twitch, YouTube, TikTok) are stored only on your machine in a local <code>.env</code> file and token files. They are never shared.</li>
-    <li><strong>OAuth tokens</strong> are saved locally for convenience and are only used to authenticate with the platforms you've authorized.</li>
-    <li><strong>Video content</strong> is processed locally and only uploaded to platforms when you explicitly confirm.</li>
-    <li><strong>No analytics, tracking, or third-party services</strong> are used by this tool.</li>
+    <li><strong>TikTok:</strong> Access to upload videos to your TikTok account via the TikTok Content Posting API. We access only the scopes required to post video content. We do not read your TikTok followers, messages, or profile beyond what is necessary to complete the upload.</li>
+    <li><strong>YouTube:</strong> Access to upload videos to your YouTube channel via the YouTube Data API v3. We access only the scopes required to upload and manage your own video content.</li>
+    <li><strong>Twitch:</strong> Read-only access to your Twitch clips and VOD data via the Twitch Helix API. We do not modify your Twitch account in any way.</li>
   </ul>
-  <p>Questions? This is a personal project by the developer — reach out via GitHub.</p>
+
+  <h2>2. How Data Is Stored</h2>
+  <ul>
+    <li>All data processed by ZaksClips remains on your local machine. No data is transmitted to any ZaksClips server.</li>
+    <li>OAuth access tokens and refresh tokens for TikTok, YouTube, and Twitch are stored locally in token files on your device. These tokens are never shared with third parties.</li>
+    <li>API credentials (client keys and secrets) are stored in a local <code>.env</code> file on your device.</li>
+    <li>Video files and metadata are stored locally in your application output directory.</li>
+  </ul>
+
+  <h2>3. Data Retention and Deletion</h2>
+  <p>Because all data is stored locally on your device, you have full control over retention and deletion:</p>
+  <ul>
+    <li>You can revoke OAuth tokens at any time by disconnecting ZaksClips from your TikTok, YouTube, or Twitch account settings on each respective platform.</li>
+    <li>Local token files can be deleted at any time by removing the corresponding files from the application directory.</li>
+    <li>Video files and metadata can be deleted through the application interface or directly from your file system.</li>
+  </ul>
+
+  <h2>4. Third-Party Services</h2>
+  <p>ZaksClips integrates with the following third-party platforms. Your use of those platforms is governed by their own privacy policies:</p>
+  <ul>
+    <li><a href="https://www.tiktok.com/legal/page/us/privacy-policy/en" target="_blank">TikTok Privacy Policy</a></li>
+    <li><a href="https://policies.google.com/privacy" target="_blank">Google / YouTube Privacy Policy</a></li>
+    <li><a href="https://www.twitch.tv/p/en/legal/privacy-notice/" target="_blank">Twitch Privacy Notice</a></li>
+  </ul>
+  <p>ZaksClips also optionally uses the Anthropic Claude API for AI-generated titles and captions. If enabled, clip transcripts are sent to Anthropic for processing. See the <a href="https://www.anthropic.com/privacy" target="_blank">Anthropic Privacy Policy</a>.</p>
+
+  <h2>5. No Analytics or Tracking</h2>
+  <p>ZaksClips does not use analytics, crash reporting, advertising networks, or any form of tracking. No usage data is collected or transmitted.</p>
+
+  <h2>6. Children's Privacy</h2>
+  <p>ZaksClips is not directed at children under the age of 13. We do not knowingly collect or process data from children.</p>
+
+  <h2>7. Your Rights</h2>
+  <p>Because ZaksClips does not collect or store your data on any external server, there is no user account or centralized data store to request access to or deletion of. All data exists locally on your own device under your control. To revoke platform access, use the account settings of each respective platform.</p>
+
+  <h2>8. Changes to This Policy</h2>
+  <p>We may update this Privacy Policy from time to time. Changes will be reflected by the "Last updated" date at the top of this page.</p>
+
+  <h2>9. Contact</h2>
+  <p>For questions about this Privacy Policy, contact us at: <a href="mailto:zak@parkstechnologies.com">zak@parkstechnologies.com</a></p>
 </body>
 </html>
