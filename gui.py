@@ -780,6 +780,9 @@ class App(ctk.CTk):
                 sd_stream[0] = None
             # Wait for the playback thread to fully exit before destroying widgets
             playback_done.wait(timeout=2.0)
+            # Ensure audio device is fully released to prevent trace trap on next player
+            import gc; gc.collect()
+            time.sleep(0.2)
         state["stop"] = _stop
 
         def _playback(start_offset=0.0):
@@ -1459,7 +1462,9 @@ class App(ctk.CTk):
                             raw_path=str(video_path),
                             clip_id=clip["id"],
                             vod_window=vod_window,
-                            stream_title=clip["title"])
+                            stream_title=clip["title"],
+                            seg_start=seg_start, seg_end=seg_end,
+                            created_at=clip["created_at"])
                         if ai_title:
                             draft_kwargs["ai_title"] = ai_title
                         if ai_caption:
@@ -1535,7 +1540,9 @@ class App(ctk.CTk):
                     date=clip["created_at"][:10],
                     clip_id=clip["id"],
                     vod_window=vod_window,
-                    stream_title=clip["title"])
+                    stream_title=clip["title"],
+                    seg_start=seg_start, seg_end=seg_end,
+                    created_at=clip["created_at"])
                 if ai_title:
                     approved_kwargs["ai_title"] = ai_title
                 if ai_caption:
@@ -1730,7 +1737,9 @@ class App(ctk.CTk):
                         title=title, caption=caption,
                         clip_id=clip["id"],
                         stream_title=vod_title,
-                        vod_window=vod_window)
+                        vod_window=vod_window,
+                        seg_start=seg_start, seg_end=seg_end,
+                        created_at=clip["created_at"])
                     if ai_title:
                         meta_kwargs["ai_title"] = ai_title
                     if ai_caption:
@@ -2305,6 +2314,7 @@ class App(ctk.CTk):
         self._cancelled.clear()
 
         vmeta = self._get_video_status(video_path.name)
+        self._set_video_status(video_path.name, reviewed=True)
         title = vmeta.get("title", video_path.stem)
         description = vmeta.get("caption", title)
         raw_path_str = vmeta.get("raw_path", "")
@@ -2364,6 +2374,10 @@ class App(ctk.CTk):
                         print("  Raw file not available for re-trimming")
                         continue
 
+                    # Let audio device fully release before opening new player
+                    import gc; gc.collect()
+                    import time; time.sleep(0.3)
+
                     # Get duration via ffprobe
                     probe = subprocess.run(
                         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -2376,8 +2390,59 @@ class App(ctk.CTk):
 
                     trim_s, trim_e, ext_s, ext_e = self._adjust_segment_dialog(
                         0, duration, video_path=cur_raw, allow_skip=False)
+                    print(f"  Trim values: trim_s={trim_s}, trim_e={trim_e}, ext_s={ext_s}, ext_e={ext_e}")
 
-                    if trim_s > 0 or trim_e > 0:
+                    needs_redownload = ext_s > 0 or ext_e > 0
+                    if needs_redownload:
+                        # Re-download with extended range from YouTube VOD
+                        saved_seg_start = vmeta.get("seg_start")
+                        saved_seg_end = vmeta.get("seg_end")
+                        saved_created_at = vmeta.get("created_at")
+                        if not saved_created_at and vmeta.get("date"):
+                            saved_created_at = vmeta["date"] + "T12:00:00Z"
+
+                        # Fallback: parse vod_window "25:18 – 28:18" if seg fields missing
+                        if saved_seg_start is None and vmeta.get("vod_window"):
+                            try:
+                                parts = vmeta["vod_window"].split(" – ")
+                                def _parse_ts(ts):
+                                    segs = ts.strip().split(":")
+                                    segs = [int(x) for x in segs]
+                                    if len(segs) == 3: return segs[0]*3600 + segs[1]*60 + segs[2]
+                                    return segs[0]*60 + segs[1]
+                                saved_seg_start = _parse_ts(parts[0])
+                                saved_seg_end = _parse_ts(parts[1])
+                            except Exception:
+                                pass
+
+                        if saved_seg_start is not None and saved_created_at:
+                            new_start = max(0, int(saved_seg_start) - ext_s + trim_s)
+                            new_end = int(saved_seg_end) + ext_e - trim_e
+                            print(f"  VOD range: {clipper.fmt_time(new_start)} → {clipper.fmt_time(new_end)} ({new_end - new_start}s)")
+                            fake_clip = {"created_at": saved_created_at}
+
+                            self.after(0, self._show_working, "Re-downloading Extended Segment", title_final[:40])
+                            try:
+                                new_raw = clipper.download_from_youtube(new_start, new_end, fake_clip)
+                                cur_raw = new_raw
+                                # Update seg range in metadata
+                                self._set_video_status(current_output.name,
+                                                       seg_start=new_start, seg_end=new_end)
+                            except Exception as e:
+                                print(f"  Re-download failed: {e}")
+                                self.after(0, self._hide_working)
+                                continue
+                            self.after(0, self._hide_working)
+
+                            # Must re-transcribe after extending
+                            self.after(0, self._show_working, "Transcribing", title_final[:40])
+                            whisper_result = clipper.transcribe(cur_raw)
+                            clipper.save_whisper_result(cur_raw, whisper_result)
+                            self.after(0, self._hide_working)
+                        else:
+                            print("  Cannot extend — no VOD segment info saved for this video")
+                            continue
+                    elif trim_s > 0 or trim_e > 0:
                         self.after(0, self._show_working, "Trimming Video", title_final[:40])
                         trimmed = clipper.trim_video(cur_raw, trim_s, trim_e)
                         self.after(0, self._hide_working)
@@ -3373,11 +3438,13 @@ class App(ctk.CTk):
                 old_total = _total_range() - 30
                 new_total = _total_range()
                 if which == "start":
-                    pos[0] = (pos[0] * old_total + 30) / new_total
+                    # Shift handles to preserve absolute positions, include new range (left → 0)
+                    pos[0] = 0.0
                     pos[1] = (pos[1] * old_total + 30) / new_total
                 else:
+                    # Shift handles to preserve absolute positions, include new range (right → 1)
                     pos[0] = (pos[0] * old_total) / new_total
-                    pos[1] = (pos[1] * old_total) / new_total
+                    pos[1] = 1.0
                 _update_display()
 
             ctk.CTkButton(btn_row, text="+30s Start", width=80, height=28, fg_color="#555",

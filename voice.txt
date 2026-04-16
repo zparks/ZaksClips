@@ -107,6 +107,8 @@
 
 - GREEK GIFT GOES WRONG
 - A SPICY INNACURATE ONE
+- WHAT A COMEBACK
+- 1700 CANT COUNT TO 3
 ## Posted Captions (YouTube/TikTok)
 - My best find ever??
 - Scotch Gambit is free elo
@@ -145,5 +147,11 @@
 
 - it couldve gone right though... #chess
 - testing my autoposts lmk what yall think lol #chess
+- recieved 73 comments to resign during this #chess
+- counting is the toughest part of chess tbh #chess
 ## Rejected (AI suggested -> what I actually used)
 # This section auto-updates when you replace an AI suggestion with your own title or caption.
+- TITLE: "HOPE CHESS SAVES THE DAY" -> "WHAT A COMEBACK"
+- CAPTION: "he was cooking then I remembered I don't know how to play #chess" -> "recieved 73 comments to resign during this #chess"
+- TITLE: "REPETITION IS HARD" -> "1700 CANT COUNT TO 3"
+- CAPTION: "counting to three might actually be the hardest part of chess #chess" -> "counting is the toughest part of chess tbh #chess"

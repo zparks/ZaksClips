@@ -516,6 +516,8 @@ def download_from_youtube(seg_start, seg_end, clip=None):
     vods = find_youtube_vod(channel_id, clip_created_at)
 
     if not vods:
+        if not sys.stdin or not sys.stdin.isatty():
+            raise RuntimeError("No YouTube VOD found for this date (no interactive input available)")
         print("  No YouTube VOD found for this date. Paste the URL manually:")
         vod_url = input("  > ").strip()
     else:
@@ -1542,6 +1544,7 @@ def schedule(test=False):
             "PATH": "/opt/homebrew/opt/ffmpeg-full/bin:/opt/homebrew/bin:/usr/bin:/bin",
         },
         "RunAtLoad": False,
+        "NetworkState": True,
     }
 
     # Unload existing if present
@@ -1757,6 +1760,19 @@ def batch_process():
     )
     log = logging.getLogger("zaksclips.batch")
 
+    # Wait for network — macOS throttles connectivity when waking from lid-closed sleep
+    import urllib.request
+    for attempt in range(6):
+        try:
+            urllib.request.urlopen("https://api.twitch.tv", timeout=5)
+            break
+        except Exception:
+            log.info(f"  Waiting for network... (attempt {attempt + 1}/6)")
+            time.sleep(10)
+    else:
+        log.error("  No network after 60s — aborting batch")
+        return
+
     processed_path = Path(__file__).parent / ".processed_clips.json"
     meta_path = Path(__file__).parent / ".video_meta.json"
 
@@ -1858,21 +1874,34 @@ def batch_process():
             stamp = datetime.now().strftime("%m-%d_%H%M%S")
             video_path = RAW_DIR / f"yt_raw_{stamp}.mp4"
             section = f"*{to_yt_ts(seg_start)}-{to_yt_ts(seg_end)}"
+            log.info(f"  Section: {section}  VOD: {vod_url}")
 
-            cmd = ["yt-dlp", "--download-sections", section,
-                   "--force-keyframes-at-cuts",
-                   "--no-overwrites",
-                   "--merge-output-format", "mp4", "-o", str(video_path), vod_url]
-            result = subprocess.run(cmd, text=True, capture_output=True)
-            if result.returncode != 0:
-                log.warning(f"  yt-dlp failed with --force-keyframes-at-cuts, retrying without...")
+            downloaded = False
+            for dl_attempt in range(3):
+                # Clean up partial files from previous attempts
+                for partial in RAW_DIR.glob(f"{video_path.stem}*"):
+                    partial.unlink(missing_ok=True)
+
                 cmd = ["yt-dlp", "--download-sections", section,
-                       "--no-overwrites",
+                       "--force-keyframes-at-cuts",
                        "--merge-output-format", "mp4", "-o", str(video_path), vod_url]
                 result = subprocess.run(cmd, text=True, capture_output=True)
-                if result.returncode != 0:
-                    log.error(f"  yt-dlp failed: {result.stderr[:200]}")
-                    continue
+                if result.returncode == 0:
+                    downloaded = True
+                    break
+                log.warning(f"  yt-dlp attempt {dl_attempt + 1}/3 failed (--force-keyframes-at-cuts), retrying without...")
+                cmd = ["yt-dlp", "--download-sections", section,
+                       "--merge-output-format", "mp4", "-o", str(video_path), vod_url]
+                result = subprocess.run(cmd, text=True, capture_output=True)
+                if result.returncode == 0:
+                    downloaded = True
+                    break
+                log.warning(f"  yt-dlp attempt {dl_attempt + 1}/3 failed: {result.stderr[:300]}")
+                if dl_attempt < 2:
+                    time.sleep(15)
+            if not downloaded:
+                log.error(f"  yt-dlp failed after 3 attempts: {result.stderr}")
+                continue
 
             log.info(f"  Downloaded: {video_path.name}")
 
@@ -1916,6 +1945,9 @@ def batch_process():
                 "clip_id": clip["id"],
                 "stream_title": vod_title,
                 "vod_window": vod_window,
+                "seg_start": seg_start,
+                "seg_end": seg_end,
+                "created_at": clip["created_at"],
             }
             if ai_title:
                 video_meta["ai_title"] = ai_title
