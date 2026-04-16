@@ -990,10 +990,15 @@ def get_youtube_credentials():
             return creds
         if creds.expired and creds.refresh_token:
             from google.auth.transport.requests import Request
-            creds.refresh(Request())
-            with open(YOUTUBE_TOKEN_PATH, "w") as f:
-                f.write(creds.to_json())
-            return creds
+            from google.auth.exceptions import RefreshError
+            try:
+                creds.refresh(Request())
+                with open(YOUTUBE_TOKEN_PATH, "w") as f:
+                    f.write(creds.to_json())
+                return creds
+            except RefreshError:
+                print("  YouTube token revoked — re-authorizing...")
+                YOUTUBE_TOKEN_PATH.unlink(missing_ok=True)
 
     if not YOUTUBE_CLIENT_ID or not YOUTUBE_CLIENT_SECRET:
         print("\n  YouTube upload requires OAuth2 credentials.")
