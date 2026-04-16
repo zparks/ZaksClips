@@ -1626,8 +1626,12 @@ def unschedule_poster():
 
 
 def is_poster_scheduled():
-    """Check if the poster launchd job is installed."""
-    return POSTER_LAUNCHD_PLIST.exists()
+    """Check if the poster launchd job is installed AND loaded in launchd."""
+    if not POSTER_LAUNCHD_PLIST.exists():
+        return False
+    result = subprocess.run(["launchctl", "list", POSTER_LAUNCHD_LABEL],
+                            capture_output=True, text=True)
+    return result.returncode == 0
 
 
 def post_scheduled():
